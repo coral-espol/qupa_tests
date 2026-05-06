@@ -26,7 +26,8 @@ setup(
     tests_require=['pytest'],
     entry_points={
         'console_scripts': [
-            'experiment = qupa_experiment.experiment_node:main',
+            'experiment         = qupa_experiment.experiment_node:main',
+            'forward_stop_test  = qupa_experiment.forward_stop_test:main',
         ],
     },
 )
