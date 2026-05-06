@@ -15,6 +15,10 @@ from rclpy.node import Node
 from geometry_msgs.msg import Twist
 from sensor_msgs.msg import LaserScan
 
+# El ir_scanner publica un LaserScan combinado de 8 slots (45° c/u).
+# Slot 2 (90° en el frame del scan) = Norte = frente del robot.
+FRONT_SLOT = 2
+
 
 class ForwardStopTest(Node):
 
@@ -31,7 +35,8 @@ class ForwardStopTest(Node):
         self._front_dist_m: float | None = None
 
         self._pub = self.create_publisher(Twist, 'cmd_vel', 10)
-        self.create_subscription(LaserScan, 'ir_n', self._ir_cb, 10)
+        # Topic único publicado por ir_scanner_node
+        self.create_subscription(LaserScan, 'scan', self._scan_cb, 10)
 
         # Publica a 10 Hz
         self.create_timer(0.1, self._step)
@@ -42,9 +47,9 @@ class ForwardStopTest(Node):
             f'parar a ≤{self._stop_m*100:.0f} cm'
         )
 
-    def _ir_cb(self, msg: LaserScan):
-        if msg.ranges:
-            d = msg.ranges[0]
+    def _scan_cb(self, msg: LaserScan):
+        if len(msg.ranges) > FRONT_SLOT:
+            d = msg.ranges[FRONT_SLOT]
             self._front_dist_m = d if math.isfinite(d) else None
 
     def _step(self):

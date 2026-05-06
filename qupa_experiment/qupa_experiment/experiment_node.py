@@ -26,15 +26,26 @@ from sensor_msgs.msg import LaserScan
 from std_msgs.msg import String
 
 
-# ── Sensor layout (topic suffix → robot-frame angle) ─────────────────────────
-# Positive angle = left of heading (ROS convention)
-SENSOR_ANGLES: dict[str, float] = {
-    'ir_w':  math.radians(90.0),    # West  — left
-    'ir_nw': math.radians(45.0),    # NW    — front-left
-    'ir_n':  math.radians(0.0),     # North — front
-    'ir_ne': math.radians(-45.0),   # NE    — front-right
-    'ir_e':  math.radians(-90.0),   # East  — right
-}
+# ── Scan slot → robot-frame angle ────────────────────────────────────────────
+# ir_scanner_node publica un único LaserScan ('scan') con 8 slots de 45°.
+# El frame del scan tiene 0° apuntando al Este; 90° = Norte = frente del robot.
+# Ángulo en frame del robot: positivo = izquierda (convención ROS).
+#
+#  slot  ángulo_scan  dirección   ángulo_robot
+#    0       0°          E          -90°  (derecha)
+#    1      45°          NE         -45°  (frente-derecha)
+#    2      90°          N            0°  (frente)
+#    3     135°          NW         +45°  (frente-izquierda, sin sensor → inf)
+#    4     180°          W          +90°  (izquierda)
+#
+# Slots 5, 6, 7 = sur/traseros — no útiles para navegación hacia adelante.
+SENSOR_SLOTS: list[tuple[int, float]] = [
+    (0, math.radians(-90.0)),   # E  — derecha
+    (1, math.radians(-45.0)),   # NE — frente-derecha
+    (2, math.radians(0.0)),     # N  — frente
+    (3, math.radians(45.0)),    # NW — frente-izquierda (siempre inf)
+    (4, math.radians(90.0)),    # W  — izquierda
+]
 
 
 class States:
@@ -111,8 +122,8 @@ class QupaExperimentNode(Node):
         self._patrol_on_ticks    = int(patrol_on_s     * self._loop_hz)
 
         # ── Sensor state ──────────────────────────────────────────────────────
-        # Distances in cm; None = no reading yet
-        self._sensor_dist: dict[str, float | None] = {k: None for k in SENSOR_ANGLES}
+        # Distancias en metros por slot; inf = sin obstáculo / sin sensor
+        self._ranges: list[float] = [float('inf')] * 8
         self._last_floor: dict = {}
 
         # ── Behaviour state ───────────────────────────────────────────────────
@@ -139,13 +150,8 @@ class QupaExperimentNode(Node):
         self._pub_led = self.create_publisher(String, 'leds/command',  10)
 
         # ── Subscriptions ─────────────────────────────────────────────────────
-        for topic_suffix in SENSOR_ANGLES:
-            self.create_subscription(
-                LaserScan, topic_suffix,
-                lambda msg, s=topic_suffix: self._ir_cb(s, msg),
-                10,
-            )
-
+        # Topic único publicado por ir_scanner_node
+        self.create_subscription(LaserScan, 'scan', self._scan_cb, 10)
         self.create_subscription(String, 'floor/color', self._floor_cb, 10)
 
         # ── Main loop ─────────────────────────────────────────────────────────
@@ -161,11 +167,8 @@ class QupaExperimentNode(Node):
     # Callbacks
     # =========================================================
 
-    def _ir_cb(self, sensor: str, msg: LaserScan):
-        if msg.ranges:
-            dist_m = msg.ranges[0]
-            if math.isfinite(dist_m):
-                self._sensor_dist[sensor] = dist_m * 100.0   # → cm
+    def _scan_cb(self, msg: LaserScan):
+        self._ranges = list(msg.ranges)
 
     def _floor_cb(self, msg: String):
         try:
@@ -177,23 +180,24 @@ class QupaExperimentNode(Node):
     # Navigation — vector-field obstacle avoidance
     # =========================================================
 
-    def _normalize(self, dist_cm: float | None) -> float:
-        """Map a raw distance in cm to a [0..1] proximity value."""
-        if dist_cm is None:
+    def _normalize(self, dist_m: float) -> float:
+        """Map distancia en metros a proximidad [0..1]."""
+        min_m = self._min_dist_cm / 100.0
+        max_m = self._max_dist_cm / 100.0
+        if not math.isfinite(dist_m) or dist_m >= max_m:
             return 0.0
-        if dist_cm >= self._max_dist_cm:
-            return 0.0
-        if dist_cm <= self._min_dist_cm:
+        if dist_m <= min_m:
             return 1.0
-        return 1.0 - (dist_cm - self._min_dist_cm) / (self._max_dist_cm - self._min_dist_cm)
+        return 1.0 - (dist_m - min_m) / (max_m - min_m)
 
     def _get_vector_move_cmd(self) -> tuple[float, float, bool]:
         """Return (linear_x, angular_z, is_avoiding)."""
         max_prox = 0.0
         torque   = 0.0
 
-        for sensor, angle in SENSOR_ANGLES.items():
-            v = self._normalize(self._sensor_dist[sensor])
+        for slot, angle in SENSOR_SLOTS:
+            dist_m = self._ranges[slot] if slot < len(self._ranges) else float('inf')
+            v = self._normalize(dist_m)
             if v > max_prox:
                 max_prox = v
             torque += v * math.sin(angle)
