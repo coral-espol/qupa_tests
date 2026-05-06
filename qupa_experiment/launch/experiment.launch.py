@@ -43,7 +43,7 @@ def generate_launch_description():
     return LaunchDescription([
 
         DeclareLaunchArgument(
-            'namespace', default_value='qupa_3A',
+            'namespace', default_value='qupa_AE',
             description='Namespace del robot',
         ),
 
