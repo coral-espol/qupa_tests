@@ -1,0 +1,39 @@
+experiment_node:
+  ros__parameters:
+
+    # --- Loop ---
+    loop_rate_hz: 10.0          # Hz — tick rate of the behaviour loop
+
+    # --- Refractory period ---
+    refractory_ticks: 20        # ticks to ignore a patch after a decision (2 s @ 10 Hz)
+
+    # --- Navigation ---
+    fwd_speed_ratio:  0.6       # fraction of v_max used during exploration
+    prox_threshold:   0.4       # normalised proximity above which avoidance kicks in
+    prox_gain:        3.0       # angular gain for avoidance torque
+    torque_deadzone:  0.15      # |torque| below this → fixed left-bias turn
+
+    # --- Task types ---
+    # COLOR → task type mapping (label from floor/color topic)
+    type_a_colors: ["MAGENTA"]
+    type_b_colors: ["YELLOW"]
+
+    # --- Task timing (ticks) ---
+    task_timing:
+      base_work_ticks:  100     # default service time (10 s @ 10 Hz)
+      min_work_ticks:    30     # minimum service time after learning (3 s @ 10 Hz)
+      learning_step:     10     # ticks reduction per specialisation unit
+
+    # --- Specialisation model (Brutschy et al. 2012) ---
+    specialization:
+      m_max:  5                 # |m| ceiling
+      gamma:  1.0               # sigmoid steepness
+
+    # --- Time-based forgetting ---
+    forgetting:
+      forget_interval_s: 30.0  # seconds of exploration with no task before |m| decreases by 1
+
+    # --- Patrol LED blink (exploration) ---
+    patrol:
+      period_s: 4.0             # full blink cycle duration (s)
+      on_s:     0.5             # LED-on portion of each cycle (s)
