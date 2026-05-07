@@ -24,6 +24,7 @@ from rclpy.node import Node
 from geometry_msgs.msg import Twist
 from sensor_msgs.msg import LaserScan
 from std_msgs.msg import String
+from qupa_msgs.srv import LEDCommand
 
 
 # ── Scan slot → robot-frame angle ────────────────────────────────────────────
@@ -145,9 +146,9 @@ class QupaExperimentNode(Node):
         self._patrol_timer     = 0
         self._reject_led_timer = 0
 
-        # ── Publishers ────────────────────────────────────────────────────────
-        self._pub_cmd = self.create_publisher(Twist,  'cmd_vel',       10)
-        self._pub_led = self.create_publisher(String, 'leds/command',  10)
+        # ── Publishers / clients ──────────────────────────────────────────────
+        self._pub_cmd  = self.create_publisher(Twist, 'cmd_vel', 10)
+        self._led_cli  = self.create_client(LEDCommand, 'leds/set')
 
         # ── Subscriptions ─────────────────────────────────────────────────────
         # Topic único publicado por ir_scanner_node
@@ -264,9 +265,9 @@ class QupaExperimentNode(Node):
         if self._last_led_cmd == new:
             return
         self._last_led_cmd = new
-        msg      = String()
-        msg.data = json.dumps({'mode': 'set_all', 'rgb': [r, g, b]})
-        self._pub_led.publish(msg)
+        req         = LEDCommand.Request()
+        req.command = json.dumps({'mode': 'set_all', 'rgb': [r, g, b]})
+        self._led_cli.call_async(req)  # fire-and-forget
 
     def _update_patrol_leds(self):
         self._patrol_timer = (self._patrol_timer + 1) % self._patrol_blink_ticks
