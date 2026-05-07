@@ -29,23 +29,24 @@ from qupa_msgs.srv import LEDCommand
 
 # ── Scan slot → robot-frame angle ────────────────────────────────────────────
 # ir_scanner_node publica un único LaserScan ('scan') con 8 slots de 45°.
-# El frame del scan tiene 0° apuntando al Este; 90° = Norte = frente del robot.
+# Convención confirmada en el robot físico: slot 0 = frente.
 # Ángulo en frame del robot: positivo = izquierda (convención ROS).
 #
-#  slot  ángulo_scan  dirección   ángulo_robot
-#    0       0°          E          -90°  (derecha)
-#    1      45°          NE         -45°  (frente-derecha)
-#    2      90°          N            0°  (frente)
-#    3     135°          NW         +45°  (frente-izquierda, sin sensor → inf)
-#    4     180°          W          +90°  (izquierda)
-#
-# Slots 5, 6, 7 = sur/traseros — no útiles para navegación hacia adelante.
+#  slot  ángulo_robot  sensor
+#    6     -90°  (derecha)          ✓
+#    7     -45°  (frente-derecha)   ✓
+#    0       0°  (frente)           ✓
+#    1     +45°  (frente-izquierda) ✓
+#    2     +90°  (izquierda)        ✓
+#    3     +135° (sin sensor → inf)
+#    4     +180° (trasero)          ✓  — no usado en avoidance
+#    5     +225° (sin sensor → inf)
 SENSOR_SLOTS: list[tuple[int, float]] = [
-    (0, math.radians(-90.0)),   # E  — derecha
-    (1, math.radians(-45.0)),   # NE — frente-derecha
-    (2, math.radians(0.0)),     # N  — frente
-    (3, math.radians(45.0)),    # NW — frente-izquierda (siempre inf)
-    (4, math.radians(90.0)),    # W  — izquierda
+    (6, math.radians(-90.0)),   # derecha
+    (7, math.radians(-45.0)),   # frente-derecha
+    (0, math.radians(  0.0)),   # frente
+    (1, math.radians( 45.0)),   # frente-izquierda
+    (2, math.radians( 90.0)),   # izquierda
 ]
 
 
