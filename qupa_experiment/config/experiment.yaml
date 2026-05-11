@@ -2,38 +2,75 @@ experiment_node:
   ros__parameters:
 
     # --- Loop ---
-    loop_rate_hz: 10.0          # Hz — tick rate of the behaviour loop
+    loop_rate_hz: 5.0           # Hz — behaviour loop rate (lower = lighter CPU)
 
     # --- Refractory period ---
-    refractory_ticks: 20        # ticks to ignore a patch after a decision (2 s @ 10 Hz)
+    refractory_s: 2.0           # seconds to ignore a patch after a decision
 
     # --- Navigation ---
-    fwd_speed_ratio:  0.6       # fraction of v_max used during exploration
-    prox_threshold:   0.4       # normalised proximity above which avoidance kicks in
+    fwd_speed_ratio:  1.0       # fraction of v_max used during exploration
+    prox_threshold:   0.2       # normalised proximity above which avoidance kicks in
     prox_gain:        3.0       # angular gain for avoidance torque
-    torque_deadzone:  0.15      # |torque| below this → fixed left-bias turn
+    torque_deadzone:  0.6       # |torque| below this → fixed left-bias turn
+
+    # --- Stuck recovery (forced in-place escape rotation) ---
+    # When the front is blocked but lateral sensors give no clear turn
+    # direction (i.e. |torque| < torque_deadzone) for stuck_threshold_s
+    # seconds in a row, the robot stops and rotates rudely in place by
+    # escape_turn_deg degrees at escape_turn_w_rps rad/s.
+    stuck_threshold_s:  1.5     # seconds in deadzone before escape kicks in
+    escape_turn_deg:  180.0     # rotation angle during escape (degrees)
+    escape_turn_w_rps:  2.0     # angular speed during escape (rad/s, +left)
 
     # --- Task types ---
     # COLOR → task type mapping (label from floor/color topic)
     type_a_colors: ["MAGENTA"]
     type_b_colors: ["YELLOW"]
 
-    # --- Task timing (ticks) ---
+    # --- Task timing (seconds) ---
+    # Service time: T = base_work_s − |m| · learning_step_s, floor min_work_s
     task_timing:
-      base_work_ticks:  100     # default service time (10 s @ 10 Hz)
-      min_work_ticks:    30     # minimum service time after learning (3 s @ 10 Hz)
-      learning_step:     10     # ticks reduction per specialisation unit
+      base_work_s:     40.0     # default service time
+      min_work_s:       10.0     # minimum service time after full learning
+      learning_step_s:  1.0     # seconds shaved off per specialisation unit
 
     # --- Specialisation model (Brutschy et al. 2012) ---
+    # Two independent counters n_a, n_b ∈ [0, m_max] (one per task type).
+    # The acceptance sigmoid uses m = n_a − n_b as input.
     specialization:
-      m_max:  5                 # |m| ceiling
+      m_max:  5                 # ceiling for each n counter
       gamma:  1.0               # sigmoid steepness
 
+    # --- Social learning (neighbour-modulated reward/penalty) ---
+    # After completing a task X, the robot reads how many neighbours were
+    # running the SAME task X (n_same, from the camera) and updates:
+    #   n_x ← n_x + Δ      (reward, current task)
+    #   n_y ← n_y − F      (penalty, opposite task)
+    # with  Δ = 1 + α · min(n_same, delta_cap_n)     ─ saturates at α·cap+1
+    #       F = 1 + β · min(n_same, forget_cap_n)    ─ saturates at β·cap+1
+    # Defaults reproduce the hand-written rule: Δ tops out at 3.7 (n=3),
+    # F tops out at 3.7 (n=2). With 0 neighbours both reduce to 1.0,
+    # recovering the original Brutschy +1/−1 update.
+    social:
+      alpha:         0.9
+      beta:          1.35
+      delta_cap_n:   3
+      forget_cap_n:  2
+
     # --- Time-based forgetting ---
+    # Both n_a and n_b decay by 1 toward 0 every forget_interval_s
+    # of search-mode exploration with no completed task.
     forgetting:
-      forget_interval_s: 30.0  # seconds of exploration with no task before |m| decreases by 1
+      forget_interval_s: 30.0
 
     # --- Patrol LED blink (exploration) ---
     patrol:
       period_s: 4.0             # full blink cycle duration (s)
       on_s:     0.5             # LED-on portion of each cycle (s)
+
+    # --- Social-learning camera ---
+    # Topic published by the vision node with neighbour-LED detections.
+    # Expected payload: std_msgs/String with JSON {"BLUE": N, "GREEN": M}
+    # — BLUE = neighbours running TYPE_A, GREEN = neighbours running TYPE_B.
+    # The subscription is only active during EXECUTE to save CPU.
+    camera_topic: "camera/detections"

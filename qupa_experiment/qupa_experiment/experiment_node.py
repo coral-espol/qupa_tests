@@ -6,13 +6,19 @@ experiment_node — ROS2 port of the MQTT-based QupaExperiment brain.
 Implements the Brutschy et al. (2012) self-organised task-allocation model
 with vector-field obstacle avoidance using the robot's IR proximity sensors.
 
+All durations are expressed in seconds and tracked via the ROS clock
+(`self.get_clock().now()`), so behaviour is independent of `loop_rate_hz`
+and compatible with `use_sim_time` for bag replay / simulation.
+
 Subscribes:
-  ir_n   / ir_nw / ir_ne / ir_w / ir_e   sensor_msgs/LaserScan  IR distances
-  floor/color                              std_msgs/String        JSON color label
+  scan          sensor_msgs/LaserScan  IR distances (8 slots, 45° each)
+  floor/color   std_msgs/String        JSON color label
 
 Publishes:
-  cmd_vel       geometry_msgs/Twist   velocity commands
-  leds/command  std_msgs/String       JSON LED commands
+  cmd_vel       geometry_msgs/Twist    velocity commands
+
+Service clients:
+  leds/set      qupa_msgs/LEDCommand   LED control
 """
 
 import json
@@ -21,6 +27,7 @@ import random
 
 import rclpy
 from rclpy.node import Node
+from rclpy.duration import Duration
 from geometry_msgs.msg import Twist
 from sensor_msgs.msg import LaserScan
 from std_msgs.msg import String
@@ -62,40 +69,59 @@ class QupaExperimentNode(Node):
         super().__init__('experiment_node')
 
         # ── Parameters ────────────────────────────────────────────────────────
-        self.declare_parameter('loop_rate_hz',     10.0)
-        self.declare_parameter('refractory_ticks', 20)
+        self.declare_parameter('loop_rate_hz',     5.0)
+        self.declare_parameter('refractory_s',     2.0)
         self.declare_parameter('fwd_speed_ratio',  0.6)
         self.declare_parameter('prox_threshold',   0.4)
         self.declare_parameter('prox_gain',        3.0)
         self.declare_parameter('torque_deadzone',  0.15)
 
+        # Stuck recovery — forced in-place rotation when deadzone persists.
+        self.declare_parameter('stuck_threshold_s', 1.5)
+        self.declare_parameter('escape_turn_deg',   180.0)
+        self.declare_parameter('escape_turn_w_rps', 2.0)
+
         self.declare_parameter('type_a_colors', ['MAGENTA'])
         self.declare_parameter('type_b_colors', ['YELLOW'])
 
-        # Flat parameters for nested YAML keys (ROS2 param flattening)
-        self.declare_parameter('task_timing.base_work_ticks', 100)
-        self.declare_parameter('task_timing.min_work_ticks',   30)
-        self.declare_parameter('task_timing.learning_step',    10)
+        # Task timing — all in seconds; m affects duration linearly.
+        self.declare_parameter('task_timing.base_work_s',    10.0)
+        self.declare_parameter('task_timing.min_work_s',      3.0)
+        self.declare_parameter('task_timing.learning_step_s', 1.0)
 
         self.declare_parameter('specialization.m_max',  5)
         self.declare_parameter('specialization.gamma',  1.0)
+
+        # Social-learning reward/penalty modulation (see Δ and F formulas).
+        # n_same = neighbours running the same task as the one just completed.
+        #   Δ = 1 + α · min(n_same, delta_cap_n)   → reward to current task
+        #   F = 1 + β · min(n_same, forget_cap_n)  → penalty to opposite task
+        self.declare_parameter('social.alpha',        0.9)
+        self.declare_parameter('social.beta',         1.35)
+        self.declare_parameter('social.delta_cap_n',  3)
+        self.declare_parameter('social.forget_cap_n', 2)
 
         self.declare_parameter('forgetting.forget_interval_s', 30.0)
 
         self.declare_parameter('patrol.period_s', 4.0)
         self.declare_parameter('patrol.on_s',     0.5)
 
-        # Motor kinematics — read from motor_node params via remapped topic,
-        # or fall back to safe defaults matching motor.yaml.
+        # Camera topic for social-learning observation during EXECUTE.
+        # Expected payload: std_msgs/String with JSON {"BLUE": N, "GREEN": M}
+        # where BLUE counts robots running a TYPE_A task and GREEN TYPE_B.
+        self.declare_parameter('camera_topic', 'camera/detections')
+
+        # Motor kinematics
         self.declare_parameter('v_max_mps',        0.08)
         self.declare_parameter('w_max_rps',        2.50)
         self.declare_parameter('obstacle_stop_cm', 15.0)
         self.declare_parameter('sensor_max_cm',    40.0)
 
         # ── Cache parameter values ────────────────────────────────────────────
-        self._loop_hz       = self.get_parameter('loop_rate_hz').value
-        self._loop_period   = 1.0 / self._loop_hz
-        self._refract_ticks = self.get_parameter('refractory_ticks').value
+        loop_hz             = self.get_parameter('loop_rate_hz').value
+        self._loop_period   = 1.0 / loop_hz
+
+        self._refract_dur   = Duration(seconds=self.get_parameter('refractory_s').value)
 
         v_max               = self.get_parameter('v_max_mps').value
         self._fwd_speed     = v_max * self.get_parameter('fwd_speed_ratio').value
@@ -106,54 +132,82 @@ class QupaExperimentNode(Node):
         self._min_dist_cm   = self.get_parameter('obstacle_stop_cm').value
         self._max_dist_cm   = self.get_parameter('sensor_max_cm').value
 
+        self._stuck_dur     = Duration(
+            seconds=self.get_parameter('stuck_threshold_s').value
+        )
+        escape_rad          = math.radians(self.get_parameter('escape_turn_deg').value)
+        escape_w            = self.get_parameter('escape_turn_w_rps').value
+        self._escape_turn_w   = escape_w                                   # rad/s, +left
+        self._escape_turn_dur = Duration(seconds=escape_rad / abs(escape_w))
+
         self._type_a_colors = list(self.get_parameter('type_a_colors').value)
         self._type_b_colors = list(self.get_parameter('type_b_colors').value)
 
-        self._base_work   = self.get_parameter('task_timing.base_work_ticks').value
-        self._min_work    = self.get_parameter('task_timing.min_work_ticks').value
-        self._learn_step  = self.get_parameter('task_timing.learning_step').value
+        self._base_work_s   = self.get_parameter('task_timing.base_work_s').value
+        self._min_work_s    = self.get_parameter('task_timing.min_work_s').value
+        self._learn_step_s  = self.get_parameter('task_timing.learning_step_s').value
 
-        self._m_max       = self.get_parameter('specialization.m_max').value
-        self._gamma       = self.get_parameter('specialization.gamma').value
+        self._m_max         = self.get_parameter('specialization.m_max').value
+        self._gamma         = self.get_parameter('specialization.gamma').value
 
-        self._forget_s    = self.get_parameter('forgetting.forget_interval_s').value
+        self._alpha         = self.get_parameter('social.alpha').value
+        self._beta          = self.get_parameter('social.beta').value
+        self._delta_cap_n   = int(self.get_parameter('social.delta_cap_n').value)
+        self._forget_cap_n  = int(self.get_parameter('social.forget_cap_n').value)
 
-        patrol_period_s   = self.get_parameter('patrol.period_s').value
-        patrol_on_s       = self.get_parameter('patrol.on_s').value
-        self._patrol_blink_ticks = int(patrol_period_s * self._loop_hz)
-        self._patrol_on_ticks    = int(patrol_on_s     * self._loop_hz)
+        self._forget_dur    = Duration(
+            seconds=self.get_parameter('forgetting.forget_interval_s').value
+        )
+
+        # Patrol blink — phase computed directly from wall clock nanoseconds.
+        self._patrol_period_ns = int(self.get_parameter('patrol.period_s').value * 1e9)
+        self._patrol_on_ns     = int(self.get_parameter('patrol.on_s').value     * 1e9)
+
+        self._camera_topic = self.get_parameter('camera_topic').value
 
         # ── Sensor state ──────────────────────────────────────────────────────
-        # Distancias en metros por slot; inf = sin obstáculo / sin sensor
         self._ranges: list[float] = [float('inf')] * 8
         self._last_floor: dict = {}
 
         # ── Behaviour state ───────────────────────────────────────────────────
-        self._state       = States.EXPLORE
-        self._state_timer = 0
+        now = self.get_clock().now()
 
-        self._ignore_ticks     = 0
-        self._decision_made    = False
-        self._last_seen_color  = 'NONE'
+        self._state                = States.EXPLORE
+        self._execute_start        = now
+        self._current_job_duration = Duration(seconds=self._base_work_s)
+        self._current_task_type    = None
 
-        # Specialisation counter — m > 0 → TYPE_A tendency, m < 0 → TYPE_B
-        self._m                 = 0
-        self._current_task_type = None
-        self._current_job_time  = self._base_work
-        self._forget_timer_s    = 0.0
+        # Timestamps in the past → "expired" (not active).
+        self._ignore_until         = now
+        self._reject_led_until     = now
+        self._last_forget_check    = now
+        self._escape_turn_until    = now
+        self._stuck_since          = None  # None → currently not stuck
 
-        # LED helpers
-        self._last_led_cmd     = None
-        self._patrol_timer     = 0
-        self._reject_led_timer = 0
+        self._decision_made        = False
+        self._last_seen_color      = 'NONE'
+
+        # Specialisation counters per task type, each ∈ [0, m_max].
+        # The Brutschy sigmoid sees m = n['TYPE_A'] − n['TYPE_B'].
+        self._n = {'TYPE_A': 0.0, 'TYPE_B': 0.0}
+
+        # LED state cache to suppress redundant service calls
+        self._last_led_cmd = None
+
+        # Social-learning observation buffer (latest counts seen by camera).
+        self._neighbor_counts = {'TYPE_A': 0, 'TYPE_B': 0}
 
         # ── Publishers / clients ──────────────────────────────────────────────
-        self._pub_cmd  = self.create_publisher(Twist, 'cmd_vel', 10)
-        self._led_cli  = self.create_client(LEDCommand, 'leds/set')
+        self._pub_cmd = self.create_publisher(Twist, 'cmd_vel', 10)
+        self._led_cli = self.create_client(LEDCommand, 'leds/set')
 
         # ── Subscriptions ─────────────────────────────────────────────────────
-        # Topic único publicado por ir_scanner_node
-        self.create_subscription(LaserScan, 'scan', self._scan_cb, 10)
+        # scan: active during EXPLORE / EXIT_PATCH only — torn down in EXECUTE.
+        # camera: active during EXECUTE only — torn down outside.
+        # floor/color: always active (needed to detect patches anytime).
+        self._scan_sub   = None
+        self._camera_sub = None
+        self._activate_scan()
         self.create_subscription(String, 'floor/color', self._floor_cb, 10)
 
         # ── Main loop ─────────────────────────────────────────────────────────
@@ -161,7 +215,7 @@ class QupaExperimentNode(Node):
 
         self._set_leds(255, 165, 0)   # Orange on boot
         self.get_logger().info(
-            f'Experiment node ready @ {self._loop_hz:.0f} Hz | '
+            f'Experiment node ready @ {loop_hz:.1f} Hz | '
             f'TYPE_A={self._type_a_colors} TYPE_B={self._type_b_colors}'
         )
 
@@ -178,6 +232,46 @@ class QupaExperimentNode(Node):
         except Exception:
             pass
 
+    def _camera_cb(self, msg: String):
+        try:
+            data = json.loads(msg.data)
+            self._neighbor_counts = {
+                'TYPE_A': int(data.get('BLUE',  0)),   # blue LED → MAGENTA task
+                'TYPE_B': int(data.get('GREEN', 0)),   # green LED → YELLOW task
+            }
+        except Exception:
+            pass
+
+    # =========================================================
+    # Subscription lifecycle (per-state activation)
+    # =========================================================
+
+    def _activate_scan(self):
+        if self._scan_sub is None:
+            self._scan_sub = self.create_subscription(
+                LaserScan, 'scan', self._scan_cb, 10
+            )
+
+    def _deactivate_scan(self):
+        if self._scan_sub is not None:
+            self.destroy_subscription(self._scan_sub)
+            self._scan_sub = None
+            # Clear stale ranges so the next nav cycle after re-activation
+            # doesn't fire avoidance on data from minutes ago.
+            self._ranges = [float('inf')] * 8
+
+    def _activate_camera(self):
+        if self._camera_sub is None:
+            self._neighbor_counts = {'TYPE_A': 0, 'TYPE_B': 0}
+            self._camera_sub = self.create_subscription(
+                String, self._camera_topic, self._camera_cb, 10
+            )
+
+    def _deactivate_camera(self):
+        if self._camera_sub is not None:
+            self.destroy_subscription(self._camera_sub)
+            self._camera_sub = None
+
     # =========================================================
     # Navigation — vector-field obstacle avoidance
     # =========================================================
@@ -192,8 +286,12 @@ class QupaExperimentNode(Node):
             return 1.0
         return 1.0 - (dist_m - min_m) / (max_m - min_m)
 
-    def _get_vector_move_cmd(self) -> tuple[float, float, bool]:
+    def _get_vector_move_cmd(self, now) -> tuple[float, float, bool]:
         """Return (linear_x, angular_z, is_avoiding)."""
+        # Forced in-place escape rotation overrides everything until it ends.
+        if now < self._escape_turn_until:
+            return 0.0, self._escape_turn_w, True
+
         max_prox = 0.0
         torque   = 0.0
 
@@ -213,11 +311,24 @@ class QupaExperimentNode(Node):
             linear_x    = self._fwd_speed * 0.2
 
             if abs(torque) < self._torque_dz:
-                # Obstacle directly ahead — fixed left-bias to break symmetry
+                # Front blocked but laterals give no usable turn direction.
+                # Start (or continue) the stuck timer; if it elapses, escape.
+                if self._stuck_since is None:
+                    self._stuck_since = now
+                elif now - self._stuck_since >= self._stuck_dur:
+                    self._escape_turn_until = now + self._escape_turn_dur
+                    self._stuck_since       = None
+                    self.get_logger().warn(
+                        '[AVOID] Stuck in deadzone — forcing escape rotation.'
+                    )
+                    return 0.0, self._escape_turn_w, True
                 angular_z = 0.4
             else:
+                self._stuck_since = None
                 turn      = -self._prox_gain * torque
                 angular_z = max(min(turn, self._w_max), -self._w_max)
+        else:
+            self._stuck_since = None
 
         return linear_x, angular_z, is_avoiding
 
@@ -228,34 +339,49 @@ class QupaExperimentNode(Node):
     def _get_floor_label(self) -> str:
         return self._last_floor.get('label', 'NONE').upper()
 
-    def _get_service_time(self) -> int:
-        specialization = abs(self._m)
-        t = self._base_work - specialization * self._learn_step
-        return int(max(t, self._min_work))
+    def _m_value(self) -> float:
+        """Signed specialisation passed to the Brutschy sigmoid."""
+        return self._n['TYPE_A'] - self._n['TYPE_B']
+
+    def _get_service_time_s(self, task_type: str) -> float:
+        specialization = self._n[task_type]
+        t = self._base_work_s - specialization * self._learn_step_s
+        return max(t, self._min_work_s)
 
     def _prob_accept(self, task_type: str) -> float:
         """Sigmoid acceptance probability (Brutschy et al. 2012, Eq. 2)."""
-        p_a = 1.0 / (1.0 + math.exp(-self._gamma * self._m))
+        p_a = 1.0 / (1.0 + math.exp(-self._gamma * self._m_value()))
         return p_a if task_type == 'TYPE_A' else 1.0 - p_a
 
     def _decide_task(self, task_type: str) -> bool:
         return random.random() < self._prob_accept(task_type)
 
-    def _update_m_after_task(self, task_type: str):
-        if task_type == 'TYPE_A':
-            self._m = min(self._m + 1, self._m_max)
-        else:
-            self._m = max(self._m - 1, -self._m_max)
-        self._forget_timer_s = 0.0
+    def _social_delta(self, n_same: int) -> float:
+        n = min(n_same, self._delta_cap_n)
+        return 1.0 + self._alpha * n
 
-    def _apply_search_forgetting(self):
-        self._forget_timer_s += self._loop_period
-        if self._forget_timer_s >= self._forget_s:
-            self._forget_timer_s = 0.0
-            if self._m > 0:
-                self._m -= 1
-            elif self._m < 0:
-                self._m += 1
+    def _social_forget(self, n_same: int) -> float:
+        n = min(n_same, self._forget_cap_n)
+        return 1.0 + self._beta * n
+
+    def _update_specialization_after_task(
+        self, task_type: str, n_same_neighbors: int,
+    ) -> tuple[float, float]:
+        delta    = self._social_delta(n_same_neighbors)
+        forget   = self._social_forget(n_same_neighbors)
+        opposite = 'TYPE_B' if task_type == 'TYPE_A' else 'TYPE_A'
+
+        self._n[task_type] = min(self._n[task_type] + delta,  self._m_max)
+        self._n[opposite]  = max(self._n[opposite]  - forget, 0.0)
+
+        self._last_forget_check = self.get_clock().now()
+        return delta, forget
+
+    def _apply_search_forgetting(self, now):
+        if now - self._last_forget_check >= self._forget_dur:
+            self._last_forget_check = now
+            self._n['TYPE_A'] = max(self._n['TYPE_A'] - 1.0, 0.0)
+            self._n['TYPE_B'] = max(self._n['TYPE_B'] - 1.0, 0.0)
 
     # =========================================================
     # Helpers — LEDs
@@ -270,17 +396,17 @@ class QupaExperimentNode(Node):
         req.command = json.dumps({'mode': 'set_all', 'rgb': [r, g, b]})
         self._led_cli.call_async(req)  # fire-and-forget
 
-    def _update_patrol_leds(self):
-        self._patrol_timer = (self._patrol_timer + 1) % self._patrol_blink_ticks
-        if self._patrol_timer < self._patrol_on_ticks:
+    def _update_patrol_leds(self, now):
+        phase_ns = now.nanoseconds % self._patrol_period_ns
+        if phase_ns < self._patrol_on_ns:
             self._set_leds(255, 165, 0)   # Orange
         else:
             self._set_leds(0, 0, 0)       # Off
 
     def _publish_velocity(self, v: float, w: float):
-        msg             = Twist()
-        msg.linear.x    = round(v, 3)
-        msg.angular.z   = round(w, 3)
+        msg           = Twist()
+        msg.linear.x  = round(v, 3)
+        msg.angular.z = round(w, 3)
         self._pub_cmd.publish(msg)
 
     # =========================================================
@@ -288,11 +414,11 @@ class QupaExperimentNode(Node):
     # =========================================================
 
     def _step(self):
+        now = self.get_clock().now()
         v, w = 0.0, 0.0
-        nav_v, nav_w, avoiding = self._get_vector_move_cmd()
+        nav_v, nav_w, avoiding = self._get_vector_move_cmd(now)
 
-        if self._ignore_ticks > 0:
-            self._ignore_ticks -= 1
+        ignoring = now < self._ignore_until
 
         current_color = self._get_floor_label()
         is_type_a     = current_color in self._type_a_colors
@@ -312,7 +438,7 @@ class QupaExperimentNode(Node):
                     self._decision_made   = False
                     self._last_seen_color = 'NONE'
 
-                if is_candidate and self._ignore_ticks == 0 and not self._decision_made:
+                if is_candidate and not ignoring and not self._decision_made:
                     task_type = 'TYPE_A' if is_type_a else 'TYPE_B'
                     accepted  = self._decide_task(task_type)
 
@@ -320,53 +446,76 @@ class QupaExperimentNode(Node):
                     self._last_seen_color = current_color
 
                     if accepted:
-                        self._current_task_type = task_type
-                        self._current_job_time  = self._get_service_time()
+                        service_s = self._get_service_time_s(task_type)
+                        self._current_task_type    = task_type
+                        self._current_job_duration = Duration(seconds=service_s)
+                        self._execute_start        = now
 
                         self.get_logger().info(
-                            f'[JOB] {task_type} ACCEPTED | '
-                            f'T={self._current_job_time / self._loop_hz:.1f}s | '
-                            f'm={self._m} | p={self._prob_accept(task_type):.2f}'
+                            f'[JOB] {task_type} ACCEPTED | T={service_s:.1f}s | '
+                            f'n_a={self._n["TYPE_A"]:.1f} n_b={self._n["TYPE_B"]:.1f} | '
+                            f'p={self._prob_accept(task_type):.2f}'
                         )
 
-                        self._state       = States.EXECUTE
-                        self._state_timer = 0
+                        # Robot will be still during EXECUTE → swap subscriptions:
+                        # release scan (no need to avoid), grab camera (observe neighbours).
+                        self._deactivate_scan()
+                        self._activate_camera()
+
+                        self._state = States.EXECUTE
                         v, w = 0.0, 0.0
 
                     else:
                         self.get_logger().info(
                             f'[SKIP] {task_type} REJECTED | '
-                            f'm={self._m} | p={self._prob_accept(task_type):.2f}'
+                            f'n_a={self._n["TYPE_A"]:.1f} n_b={self._n["TYPE_B"]:.1f} | '
+                            f'p={self._prob_accept(task_type):.2f}'
                         )
-                        self._reject_led_timer = self._refract_ticks
-                        self._ignore_ticks     = self._refract_ticks
+                        self._reject_led_until = now + self._refract_dur
+                        self._ignore_until     = now + self._refract_dur
 
                 # LED management during exploration
-                if not is_candidate or self._ignore_ticks > 0:
-                    if self._reject_led_timer > 0:
-                        self._reject_led_timer -= 1
+                if not is_candidate or ignoring:
+                    if now < self._reject_led_until:
                         self._set_leds(255, 0, 0)      # Red → recent rejection
                     else:
-                        self._apply_search_forgetting()
-                        self._update_patrol_leds()     # Orange patrol blink
+                        self._apply_search_forgetting(now)
+                        self._update_patrol_leds(now)  # Orange patrol blink
 
         # ---- EXECUTE ----
+        # Robot stays put while the task runs. Scan is off (no need to avoid),
+        # camera is on so we can observe neighbour LEDs for social learning.
         elif self._state == States.EXECUTE:
             v, w = 0.0, 0.0
-            self._state_timer += 1
 
             if self._current_task_type == 'TYPE_A':
                 self._set_leds(0, 0, 255)     # Blue  — MAGENTA task
             else:
                 self._set_leds(0, 255, 0)     # Green — YELLOW task
 
-            if self._state_timer >= self._current_job_time:
-                self._update_m_after_task(self._current_task_type)
+            if now - self._execute_start >= self._current_job_duration:
+                neigh_a = self._neighbor_counts['TYPE_A']
+                neigh_b = self._neighbor_counts['TYPE_B']
+                n_same  = self._neighbor_counts[self._current_task_type]
+
+                delta, forget = self._update_specialization_after_task(
+                    self._current_task_type, n_same
+                )
+
+                # Swap subscriptions back: camera off, scan on for EXIT_PATCH.
+                self._deactivate_camera()
+                self._activate_scan()
+
                 self._state = States.EXIT
+                m_val = self._m_value()
+                p_a   = 1.0 / (1.0 + math.exp(-self._gamma * m_val))
                 self.get_logger().info(
                     f'[DONE] {self._current_task_type} completed | '
-                    f'm={self._m} | p_A={1.0/(1.0+math.exp(-self._gamma*self._m)):.2f} | '
-                    f'T={self._current_job_time / self._loop_hz:.1f}s'
+                    f'neighbours A={neigh_a} B={neigh_b} (same={n_same}) | '
+                    f'Δ={delta:.2f} F={forget:.2f} | '
+                    f'n_a={self._n["TYPE_A"]:.1f} n_b={self._n["TYPE_B"]:.1f} | '
+                    f'p_A={p_a:.2f} | '
+                    f'T={self._current_job_duration.nanoseconds * 1e-9:.1f}s'
                 )
 
         # ---- EXIT PATCH ----
@@ -376,7 +525,7 @@ class QupaExperimentNode(Node):
 
             if not is_candidate:
                 self._state           = States.EXPLORE
-                self._ignore_ticks    = self._refract_ticks
+                self._ignore_until    = now + self._refract_dur
                 self._decision_made   = False
                 self._last_seen_color = 'NONE'
                 self.get_logger().info('[FREE] Left patch — resuming exploration.')
@@ -386,6 +535,8 @@ class QupaExperimentNode(Node):
     def destroy_node(self):
         self._publish_velocity(0.0, 0.0)
         self._set_leds(0, 0, 0)
+        self._deactivate_camera()
+        self._deactivate_scan()
         super().destroy_node()
 
 
