@@ -162,7 +162,7 @@ class QupaExperimentClassicNode(Node):
 
         # ── Publishers / clients ──────────────────────────────────────────────
         self._pub_cmd = self.create_publisher(Twist, 'cmd_vel', 10)
-        self._led_cli = self.create_client(LEDCommand, 'leds/set')
+        self._led_cli = self.create_client(LEDCommand, 'set')
 
         # ── Subscriptions ─────────────────────────────────────────────────────
         # Both stay alive for the lifetime of the node (no swapping).

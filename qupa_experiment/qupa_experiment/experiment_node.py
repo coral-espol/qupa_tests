@@ -199,7 +199,7 @@ class QupaExperimentNode(Node):
 
         # ── Publishers / clients ──────────────────────────────────────────────
         self._pub_cmd = self.create_publisher(Twist, 'cmd_vel', 10)
-        self._led_cli = self.create_client(LEDCommand, 'leds/set')
+        self._led_cli = self.create_client(LEDCommand, 'set')
 
         # ── Subscriptions ─────────────────────────────────────────────────────
         # scan: active during EXPLORE / EXIT_PATCH only — torn down in EXECUTE.
