@@ -30,7 +30,7 @@ def generate_launch_description():
     experiment_node = Node(
         package='qupa_experiment',
         executable='experiment_classic',
-        name='experiment_node_classic',
+        name='experiment_node',
         namespace=ns,
         output='screen',
         parameters=[
