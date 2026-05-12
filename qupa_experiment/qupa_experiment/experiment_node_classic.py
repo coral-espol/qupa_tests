@@ -83,6 +83,7 @@ class QupaExperimentClassicNode(Node):
 
         self.declare_parameter('specialization.m_max',  5)
         self.declare_parameter('specialization.gamma',  1.0)
+        self.declare_parameter('specialization.k',      1.15)
 
         self.declare_parameter('forgetting.forget_interval_s', 30.0)
 
@@ -93,7 +94,6 @@ class QupaExperimentClassicNode(Node):
         self.declare_parameter('w_max_rps',        2.50)
         self.declare_parameter('obstacle_stop_cm', 15.0)
         self.declare_parameter('sensor_max_cm',    25.0)
-        self.declare_parameter('k',              1.15)
 
         # ── Cache parameter values ────────────────────────────────────────────
         loop_hz             = self.get_parameter('loop_rate_hz').value
@@ -109,7 +109,7 @@ class QupaExperimentClassicNode(Node):
         self._torque_dz     = self.get_parameter('torque_deadzone').value
         self._min_dist_cm   = self.get_parameter('obstacle_stop_cm').value
         self._max_dist_cm   = self.get_parameter('sensor_max_cm').value
-        self._k              = self.get_parameter('k').value
+        self._k              = self.get_parameter('specialization.k').value
 
         self._stuck_dur     = Duration(
             seconds=self.get_parameter('stuck_threshold_s').value

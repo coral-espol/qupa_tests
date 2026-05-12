@@ -41,7 +41,7 @@ experiment_node:
     specialization:
       m_max:  12                # ceiling for each n counter
       gamma:  1.0               # sigmoid steepness
-      k=1.15:   1.15            # specilization constant
+      k:        1.15             # specialization service-time constant
 
     # --- Social learning (neighbour-modulated reward/penalty) ---
     # After completing a task X, the robot reads how many neighbours were
