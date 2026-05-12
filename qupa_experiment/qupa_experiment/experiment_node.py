@@ -91,6 +91,7 @@ class QupaExperimentNode(Node):
 
         self.declare_parameter('specialization.m_max',  5)
         self.declare_parameter('specialization.gamma',  1.0)
+        self.declare_parameter('specialization.k',      1.0)
 
         # Social-learning reward/penalty modulation (see Δ and F formulas).
         # n_same = neighbours running the same task as the one just completed.
@@ -149,6 +150,8 @@ class QupaExperimentNode(Node):
 
         self._m_max         = self.get_parameter('specialization.m_max').value
         self._gamma         = self.get_parameter('specialization.gamma').value
+        self._k             = self.get_parameter('specialization.k').value
+        self._c             = self._m_max % 2.0
 
         self._alpha         = self.get_parameter('social.alpha').value
         self._beta          = self.get_parameter('social.beta').value
