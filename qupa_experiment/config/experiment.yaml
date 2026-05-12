@@ -9,8 +9,8 @@ experiment_node:
 
     # --- Navigation ---
     fwd_speed_ratio:  1.0       # fraction of v_max used during exploration
-    prox_threshold:   0.2       # normalised proximity above which avoidance kicks in
-    prox_gain:        3.0       # angular gain for avoidance torque
+    prox_threshold:   0.05       # normalised proximity above which avoidance kicks in
+    prox_gain:        2.0       # angular gain for avoidance torque
     torque_deadzone:  0.6       # |torque| below this → fixed left-bias turn
 
     # --- Stuck recovery (forced in-place escape rotation) ---
@@ -30,16 +30,18 @@ experiment_node:
     # --- Task timing (seconds) ---
     # Service time: T = base_work_s − |m| · learning_step_s, floor min_work_s
     task_timing:
-      base_work_s:     40.0     # default service time
-      min_work_s:       10.0     # minimum service time after full learning
+      base_work_s:     60.0     # default service time
+      min_work_s:       8.0     # minimum service time after full learning
       learning_step_s:  1.0     # seconds shaved off per specialisation unit
+      
 
     # --- Specialisation model (Brutschy et al. 2012) ---
     # Two independent counters n_a, n_b ∈ [0, m_max] (one per task type).
     # The acceptance sigmoid uses m = n_a − n_b as input.
     specialization:
-      m_max:  5                 # ceiling for each n counter
+      m_max:  12                # ceiling for each n counter
       gamma:  1.0               # sigmoid steepness
+      k=1.15:   1.15            # specilization constant
 
     # --- Social learning (neighbour-modulated reward/penalty) ---
     # After completing a task X, the robot reads how many neighbours were

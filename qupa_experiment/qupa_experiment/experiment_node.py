@@ -345,7 +345,7 @@ class QupaExperimentNode(Node):
 
     def _get_service_time_s(self, task_type: str) -> float:
         specialization = self._n[task_type]
-        t = self._base_work_s - specialization * self._learn_step_s
+        t = self._base_work_s - (self._base_work_s / (self._k * (1 + math.exp(-specialization + self._c))))
         return max(t, self._min_work_s)
 
     def _prob_accept(self, task_type: str) -> float:

@@ -89,10 +89,11 @@ class QupaExperimentClassicNode(Node):
         self.declare_parameter('patrol.period_s', 4.0)
         self.declare_parameter('patrol.on_s',     0.5)
 
-        self.declare_parameter('v_max_mps',        0.08)
+        self.declare_parameter('v_max_mps',        0.1)
         self.declare_parameter('w_max_rps',        2.50)
         self.declare_parameter('obstacle_stop_cm', 15.0)
-        self.declare_parameter('sensor_max_cm',    40.0)
+        self.declare_parameter('sensor_max_cm',    25.0)
+        self.declare_parameter('k',              1.15)
 
         # ── Cache parameter values ────────────────────────────────────────────
         loop_hz             = self.get_parameter('loop_rate_hz').value
@@ -108,6 +109,7 @@ class QupaExperimentClassicNode(Node):
         self._torque_dz     = self.get_parameter('torque_deadzone').value
         self._min_dist_cm   = self.get_parameter('obstacle_stop_cm').value
         self._max_dist_cm   = self.get_parameter('sensor_max_cm').value
+        self._k              = self.get_parameter('k').value
 
         self._stuck_dur     = Duration(
             seconds=self.get_parameter('stuck_threshold_s').value
@@ -126,6 +128,7 @@ class QupaExperimentClassicNode(Node):
 
         self._m_max         = self.get_parameter('specialization.m_max').value
         self._gamma         = self.get_parameter('specialization.gamma').value
+        self._c             = self._m_max % 2.0  # specialization sigmoid midpoint
 
         self._forget_dur    = Duration(
             seconds=self.get_parameter('forgetting.forget_interval_s').value
@@ -253,11 +256,14 @@ class QupaExperimentClassicNode(Node):
     def _get_floor_label(self) -> str:
         return self._last_floor.get('label', 'NONE').upper()
 
-    def _get_service_time_s(self) -> float:
-        specialization = abs(self._m)
-        t = self._base_work_s - specialization * self._learn_step_s
+    def _get_service_time_s(self, task_type: str) -> float:
+        specialization = self._n[task_type]
+        k=self._k
+        c=self._c
+        wstd=self._base_work_s
+        t = wstd - (wstd / (k * (1 + math.exp(-specialization + c))))
         return max(t, self._min_work_s)
-
+    
     def _prob_accept(self, task_type: str) -> float:
         p_a = 1.0 / (1.0 + math.exp(-self._gamma * self._m))
         return p_a if task_type == 'TYPE_A' else 1.0 - p_a
