@@ -256,12 +256,14 @@ class QupaExperimentClassicNode(Node):
     def _get_floor_label(self) -> str:
         return self._last_floor.get('label', 'NONE').upper()
 
-    def _get_service_time_s(self, task_type: str) -> float:
-        specialization = self._n[task_type]
-        k=self._k
-        c=self._c
-        wstd=self._base_work_s
-        t = wstd - (wstd / (k * (1 + math.exp(-specialization + c))))
+    def _get_service_time_s(self) -> float:
+        # Classic uses a single signed counter m; specialisation magnitude
+        # is |m| regardless of which task we're about to do.
+        specialization = abs(self._m)
+        k    = self._k
+        c    = self._c
+        wstd = self._base_work_s
+        t    = wstd - (wstd / (k * (1 + math.exp(-specialization + c))))
         return max(t, self._min_work_s)
     
     def _prob_accept(self, task_type: str) -> float:
