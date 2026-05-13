@@ -35,29 +35,43 @@ experiment_node:
       learning_step_s:  1.0     # seconds shaved off per specialisation unit
       
 
-    # --- Specialisation model (Brutschy et al. 2012) ---
-    # Two independent counters n_a, n_b ∈ [0, m_max] (one per task type).
-    # The acceptance sigmoid uses m = n_a − n_b as input.
+    # --- Specialisation model (Brutschy et al. 2012, ported from Lua) ---
+    # Per-task counters n_a, n_b ∈ [0, m_max] feed the service-time sigmoid.
+    # An independent signed memory m ∈ [-m_max, +m_max] feeds the acceptance
+    # sigmoid. m and the n's evolve in parallel (Lua convention).
     specialization:
-      m_max:  12                # ceiling for each n counter
-      gamma:  1.0               # sigmoid steepness
-      k:        1.15             # specialization service-time constant
+      m_max:  12                # ceiling for n counters and |m|
+      gamma:  1.0               # acceptance sigmoid steepness
+      k:      1.15              # service-time gain (Lua K_GAIN)
+
+    # --- Greedy override ---
+    # true  → always accept candidate patches (skip acceptance sigmoid)
+    # false → use Brutschy sigmoid with m
+    greedy_mode: false
 
     # --- Social learning (neighbour-modulated reward/penalty) ---
-    # After completing a task X, the robot reads how many neighbours were
-    # running the SAME task X (n_same, from the camera) and updates:
-    #   n_x ← n_x + Δ      (reward, current task)
-    #   n_y ← n_y − F      (penalty, opposite task)
-    # with  Δ = 1 + α · min(n_same, delta_cap_n)     ─ saturates at α·cap+1
-    #       F = 1 + β · min(n_same, forget_cap_n)    ─ saturates at β·cap+1
-    # Defaults reproduce the hand-written rule: Δ tops out at 3.7 (n=3),
-    # F tops out at 3.7 (n=2). With 0 neighbours both reduce to 1.0,
-    # recovering the original Brutschy +1/−1 update.
+    # After completing task X with n_same neighbours observed doing X:
+    #   n_x ← n_x + Δ        and    m ← m ± Δ      (sign per task)
+    #   n_y ← n_y − F
+    # Lua-equivalent piecewise rules:
+    #   reward = 1 + α · min(n_same, delta_cap_n)
+    #   Δ      = 1 + reward                       ── saturates at 1+1+α·cap
+    #   F      = 1 + β · n_same   if n_same < forget_cap_n
+    #          = forget_saturation                ── hardcoded upper bound
+    # With defaults (α=0.9, β=1.5, caps 3/2, sat=3.7):
+    #   Δ: 2.0 (n=0) → 4.7 (n≥3)
+    #   F: 1.0 (n=0) → 2.5 (n=1) → 3.7 (n≥2)
+    #
+    # count_mode selects which observation feeds Δ/F:
+    #   'iterative' → max simultáneo durante EXECUTE   (Lua SOCIAL_BOOL=true)
+    #   'snapshot'  → conteo al inicio del EXECUTE     (Lua SOCIAL_BOOL=false)
     social:
-      alpha:         0.9
-      beta:          1.35
-      delta_cap_n:   3
-      forget_cap_n:  2
+      alpha:              0.9
+      beta:               1.5
+      delta_cap_n:        3
+      forget_cap_n:       2
+      forget_saturation:  3.7
+      count_mode:         iterative
 
     # --- Time-based forgetting ---
     # Both n_a and n_b decay by 1 toward 0 every forget_interval_s

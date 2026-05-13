@@ -87,6 +87,9 @@ class QupaExperimentClassicNode(Node):
 
         self.declare_parameter('forgetting.forget_interval_s', 30.0)
 
+        # Greedy bypasses the acceptance sigmoid (always accepts).
+        self.declare_parameter('greedy_mode', False)
+
         self.declare_parameter('patrol.period_s', 4.0)
         self.declare_parameter('patrol.on_s',     0.5)
 
@@ -128,11 +131,12 @@ class QupaExperimentClassicNode(Node):
 
         self._m_max         = self.get_parameter('specialization.m_max').value
         self._gamma         = self.get_parameter('specialization.gamma').value
-        self._c             = self._m_max % 2.0  # specialization sigmoid midpoint
+        self._c             = self._m_max / 2.0  # sigmoid midpoint (Lua: c = N_MAX/2)
 
         self._forget_dur    = Duration(
             seconds=self.get_parameter('forgetting.forget_interval_s').value
         )
+        self._greedy_mode   = bool(self.get_parameter('greedy_mode').value)
 
         self._patrol_period_ns = int(self.get_parameter('patrol.period_s').value * 1e9)
         self._patrol_on_ns     = int(self.get_parameter('patrol.on_s').value     * 1e9)
@@ -260,17 +264,21 @@ class QupaExperimentClassicNode(Node):
         # Classic uses a single signed counter m; specialisation magnitude
         # is |m| regardless of which task we're about to do.
         specialization = abs(self._m)
+        if specialization <= 0:
+            return self._base_work_s
         k    = self._k
         c    = self._c
         wstd = self._base_work_s
         t    = wstd - (wstd / (k * (1 + math.exp(-specialization + c))))
         return max(t, self._min_work_s)
-    
+
     def _prob_accept(self, task_type: str) -> float:
         p_a = 1.0 / (1.0 + math.exp(-self._gamma * self._m))
         return p_a if task_type == 'TYPE_A' else 1.0 - p_a
 
     def _decide_task(self, task_type: str) -> bool:
+        if self._greedy_mode:
+            return True
         return random.random() < self._prob_accept(task_type)
 
     def _update_m_after_task(self, task_type: str):

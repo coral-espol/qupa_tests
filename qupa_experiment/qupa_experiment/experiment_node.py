@@ -97,10 +97,16 @@ class QupaExperimentNode(Node):
         # n_same = neighbours running the same task as the one just completed.
         #   Δ = 1 + α · min(n_same, delta_cap_n)   → reward to current task
         #   F = 1 + β · min(n_same, forget_cap_n)  → penalty to opposite task
-        self.declare_parameter('social.alpha',        0.9)
-        self.declare_parameter('social.beta',         1.35)
-        self.declare_parameter('social.delta_cap_n',  3)
-        self.declare_parameter('social.forget_cap_n', 2)
+        self.declare_parameter('social.alpha',             0.9)
+        self.declare_parameter('social.beta',              1.5)
+        self.declare_parameter('social.delta_cap_n',       3)
+        self.declare_parameter('social.forget_cap_n',      2)
+        self.declare_parameter('social.forget_saturation', 3.7)
+        # 'iterative' = max simultáneo durante EXECUTE  (Lua: SOCIAL_BOOL=true)
+        # 'snapshot'  = conteo al inicio del EXECUTE     (Lua: SOCIAL_BOOL=false)
+        self.declare_parameter('social.count_mode',   'iterative')
+        # Greedy bypasses the sigmoid and always accepts a candidate patch.
+        self.declare_parameter('greedy_mode',         False)
 
         self.declare_parameter('forgetting.forget_interval_s', 30.0)
 
@@ -151,12 +157,15 @@ class QupaExperimentNode(Node):
         self._m_max         = self.get_parameter('specialization.m_max').value
         self._gamma         = self.get_parameter('specialization.gamma').value
         self._k             = self.get_parameter('specialization.k').value
-        self._c             = self._m_max % 2.0
+        self._c             = self._m_max / 2.0   # sigmoid midpoint (Lua: c = N_MAX/2)
 
         self._alpha         = self.get_parameter('social.alpha').value
         self._beta          = self.get_parameter('social.beta').value
         self._delta_cap_n   = int(self.get_parameter('social.delta_cap_n').value)
         self._forget_cap_n  = int(self.get_parameter('social.forget_cap_n').value)
+        self._forget_sat    = self.get_parameter('social.forget_saturation').value
+        self._count_mode    = self.get_parameter('social.count_mode').value
+        self._greedy_mode   = bool(self.get_parameter('greedy_mode').value)
 
         self._forget_dur    = Duration(
             seconds=self.get_parameter('forgetting.forget_interval_s').value
@@ -190,15 +199,30 @@ class QupaExperimentNode(Node):
         self._decision_made        = False
         self._last_seen_color      = 'NONE'
 
-        # Specialisation counters per task type, each ∈ [0, m_max].
-        # The Brutschy sigmoid sees m = n['TYPE_A'] − n['TYPE_B'].
+        # Specialisation counters per task type (used for service-time sigmoid).
+        # Each n ∈ [0, m_max].
         self._n = {'TYPE_A': 0.0, 'TYPE_B': 0.0}
+
+        # Signed specialisation m ∈ [-m_max, +m_max] used by the *acceptance*
+        # sigmoid. Mirrors the Lua: m is an independent state updated by ±delta
+        # after each task, NOT derived from n[A] − n[B]. The two may diverge
+        # because n is bounded ≥ 0 and decays independently.
+        self._m = 0.0
 
         # LED state cache to suppress redundant service calls
         self._last_led_cmd = None
 
-        # Social-learning observation buffer (latest counts seen by camera).
-        self._neighbor_counts = {'TYPE_A': 0, 'TYPE_B': 0}
+        # Social-learning observation buffers.
+        #   _neighbor_counts     → latest sample from the camera
+        #   _max_neighbor_counts → peak simultaneous count during EXECUTE
+        #   _snapshot_counts     → counts captured at the moment EXECUTE begins
+        # Which one is fed into Δ/F is chosen by `social.count_mode`:
+        #   'iterative' → max (Lua SOCIAL_BOOL=true)
+        #   'snapshot'  → snapshot at start of EXECUTE (Lua SOCIAL_BOOL=false)
+        self._neighbor_counts     = {'TYPE_A': 0, 'TYPE_B': 0}
+        self._max_neighbor_counts = {'TYPE_A': 0, 'TYPE_B': 0}
+        self._snapshot_counts     = {'TYPE_A': 0, 'TYPE_B': 0}
+        self._tracking_exec_max   = False
 
         # ── Publishers / clients ──────────────────────────────────────────────
         self._pub_cmd = self.create_publisher(Twist, 'cmd_vel', 10)
@@ -206,12 +230,14 @@ class QupaExperimentNode(Node):
 
         # ── Subscriptions ─────────────────────────────────────────────────────
         # scan: active during EXPLORE / EXIT_PATCH only — torn down in EXECUTE.
-        # camera: active during EXECUTE only — torn down outside.
+        # camera: always active so a fresh snapshot exists the moment we enter
+        #   EXECUTE (mirrors the Lua, where the omnidirectional camera is
+        #   queried directly at the patch-entry instant).
         # floor/color: always active (needed to detect patches anytime).
-        self._scan_sub   = None
-        self._camera_sub = None
+        self._scan_sub = None
         self._activate_scan()
-        self.create_subscription(String, 'floor/color', self._floor_cb, 10)
+        self.create_subscription(String, 'floor/color',       self._floor_cb,  10)
+        self.create_subscription(String, self._camera_topic,  self._camera_cb, 10)
 
         # ── Main loop ─────────────────────────────────────────────────────────
         self._timer = self.create_timer(self._loop_period, self._step)
@@ -242,6 +268,12 @@ class QupaExperimentNode(Node):
                 'TYPE_A': int(data.get('BLUE',  0)),   # blue LED → MAGENTA task
                 'TYPE_B': int(data.get('GREEN', 0)),   # green LED → YELLOW task
             }
+            # Only update the EXECUTE-window peak while we're actually tracking
+            # (set by _begin_exec_observation / cleared after Δ/F is applied).
+            if self._tracking_exec_max:
+                for k in ('TYPE_A', 'TYPE_B'):
+                    if self._neighbor_counts[k] > self._max_neighbor_counts[k]:
+                        self._max_neighbor_counts[k] = self._neighbor_counts[k]
         except Exception:
             pass
 
@@ -263,17 +295,15 @@ class QupaExperimentNode(Node):
             # doesn't fire avoidance on data from minutes ago.
             self._ranges = [float('inf')] * 8
 
-    def _activate_camera(self):
-        if self._camera_sub is None:
-            self._neighbor_counts = {'TYPE_A': 0, 'TYPE_B': 0}
-            self._camera_sub = self.create_subscription(
-                String, self._camera_topic, self._camera_cb, 10
-            )
+    def _begin_exec_observation(self):
+        """Called at the moment we enter EXECUTE. Captures snapshot and
+        primes the per-task peak counter at the snapshot value."""
+        self._snapshot_counts     = dict(self._neighbor_counts)
+        self._max_neighbor_counts = dict(self._neighbor_counts)
+        self._tracking_exec_max   = True
 
-    def _deactivate_camera(self):
-        if self._camera_sub is not None:
-            self.destroy_subscription(self._camera_sub)
-            self._camera_sub = None
+    def _end_exec_observation(self):
+        self._tracking_exec_max = False
 
     # =========================================================
     # Navigation — vector-field obstacle avoidance
@@ -342,30 +372,38 @@ class QupaExperimentNode(Node):
     def _get_floor_label(self) -> str:
         return self._last_floor.get('label', 'NONE').upper()
 
-    def _m_value(self) -> float:
-        """Signed specialisation passed to the Brutschy sigmoid."""
-        return self._n['TYPE_A'] - self._n['TYPE_B']
-
     def _get_service_time_s(self, task_type: str) -> float:
+        # Lua's short-circuit: n=0 → full base work, no descuento.
         specialization = self._n[task_type]
+        if specialization <= 0:
+            return self._base_work_s
         t = self._base_work_s - (self._base_work_s / (self._k * (1 + math.exp(-specialization + self._c))))
         return max(t, self._min_work_s)
 
     def _prob_accept(self, task_type: str) -> float:
         """Sigmoid acceptance probability (Brutschy et al. 2012, Eq. 2)."""
-        p_a = 1.0 / (1.0 + math.exp(-self._gamma * self._m_value()))
+        p_a = 1.0 / (1.0 + math.exp(-self._gamma * self._m))
         return p_a if task_type == 'TYPE_A' else 1.0 - p_a
 
     def _decide_task(self, task_type: str) -> bool:
+        if self._greedy_mode:
+            return True
         return random.random() < self._prob_accept(task_type)
 
     def _social_delta(self, n_same: int) -> float:
-        n = min(n_same, self._delta_cap_n)
-        return 1.0 + self._alpha * n
+        # Mirrors Lua: reward saturates at 1 + α·cap (= 3.7 with α=0.9, cap=3).
+        # The applied delta is 1.0 (individual increment) + reward (social).
+        n      = min(n_same, self._delta_cap_n)
+        reward = 1.0 + self._alpha * n
+        return 1.0 + reward
 
     def _social_forget(self, n_same: int) -> float:
-        n = min(n_same, self._forget_cap_n)
-        return 1.0 + self._beta * n
+        # Mirrors Lua: piecewise — linear under cap, hardcoded saturation above.
+        # The Lua's BETA_SOCIAL var is unused; the formula uses 1.5 directly,
+        # but the saturation is a separate constant (3.7), so we expose both.
+        if n_same < self._forget_cap_n:
+            return 1.0 + self._beta * n_same
+        return self._forget_sat
 
     def _update_specialization_after_task(
         self, task_type: str, n_same_neighbors: int,
@@ -374,8 +412,16 @@ class QupaExperimentNode(Node):
         forget   = self._social_forget(n_same_neighbors)
         opposite = 'TYPE_B' if task_type == 'TYPE_A' else 'TYPE_A'
 
+        # Per-task counters (service-time sigmoid input).
         self._n[task_type] = min(self._n[task_type] + delta,  self._m_max)
         self._n[opposite]  = max(self._n[opposite]  - forget, 0.0)
+
+        # Signed memory m (acceptance sigmoid input) — independent state,
+        # updated by ±delta only (Lua convention).
+        if task_type == 'TYPE_A':
+            self._m = max(min(self._m + delta,  self._m_max), -self._m_max)
+        else:
+            self._m = max(min(self._m - delta,  self._m_max), -self._m_max)
 
         self._last_forget_check = self.get_clock().now()
         return delta, forget
@@ -385,6 +431,9 @@ class QupaExperimentNode(Node):
             self._last_forget_check = now
             self._n['TYPE_A'] = max(self._n['TYPE_A'] - 1.0, 0.0)
             self._n['TYPE_B'] = max(self._n['TYPE_B'] - 1.0, 0.0)
+            # m decays toward 0 by 1 (Lua's distance-based decay analogue).
+            if   self._m > 0: self._m = max(self._m - 1.0, 0.0)
+            elif self._m < 0: self._m = min(self._m + 1.0, 0.0)
 
     # =========================================================
     # Helpers — LEDs
@@ -456,14 +505,15 @@ class QupaExperimentNode(Node):
 
                         self.get_logger().info(
                             f'[JOB] {task_type} ACCEPTED | T={service_s:.1f}s | '
+                            f'm={self._m:.1f} | '
                             f'n_a={self._n["TYPE_A"]:.1f} n_b={self._n["TYPE_B"]:.1f} | '
                             f'p={self._prob_accept(task_type):.2f}'
                         )
 
-                        # Robot will be still during EXECUTE → swap subscriptions:
-                        # release scan (no need to avoid), grab camera (observe neighbours).
+                        # Robot will be still during EXECUTE → release scan
+                        # (no need to avoid). Camera stays subscribed always.
                         self._deactivate_scan()
-                        self._activate_camera()
+                        self._begin_exec_observation()
 
                         self._state = States.EXECUTE
                         v, w = 0.0, 0.0
@@ -471,6 +521,7 @@ class QupaExperimentNode(Node):
                     else:
                         self.get_logger().info(
                             f'[SKIP] {task_type} REJECTED | '
+                            f'm={self._m:.1f} | '
                             f'n_a={self._n["TYPE_A"]:.1f} n_b={self._n["TYPE_B"]:.1f} | '
                             f'p={self._prob_accept(task_type):.2f}'
                         )
@@ -497,25 +548,31 @@ class QupaExperimentNode(Node):
                 self._set_leds(0, 255, 0)     # Green — YELLOW task
 
             if now - self._execute_start >= self._current_job_duration:
-                neigh_a = self._neighbor_counts['TYPE_A']
-                neigh_b = self._neighbor_counts['TYPE_B']
-                n_same  = self._neighbor_counts[self._current_task_type]
+                self._end_exec_observation()
+
+                peak_a = self._max_neighbor_counts['TYPE_A']
+                peak_b = self._max_neighbor_counts['TYPE_B']
+
+                # Pick the neighbour count fed into Δ/F per `social.count_mode`.
+                if self._count_mode == 'snapshot':
+                    n_same = self._snapshot_counts[self._current_task_type]
+                else:  # 'iterative' (default)
+                    n_same = self._max_neighbor_counts[self._current_task_type]
 
                 delta, forget = self._update_specialization_after_task(
                     self._current_task_type, n_same
                 )
 
-                # Swap subscriptions back: camera off, scan on for EXIT_PATCH.
-                self._deactivate_camera()
+                # Camera stays subscribed; just bring scan back for EXIT_PATCH.
                 self._activate_scan()
 
                 self._state = States.EXIT
-                m_val = self._m_value()
-                p_a   = 1.0 / (1.0 + math.exp(-self._gamma * m_val))
+                p_a = 1.0 / (1.0 + math.exp(-self._gamma * self._m))
                 self.get_logger().info(
                     f'[DONE] {self._current_task_type} completed | '
-                    f'neighbours A={neigh_a} B={neigh_b} (same={n_same}) | '
+                    f'peak A={peak_a} B={peak_b} (n_same={n_same}, mode={self._count_mode}) | '
                     f'Δ={delta:.2f} F={forget:.2f} | '
+                    f'm={self._m:.1f} | '
                     f'n_a={self._n["TYPE_A"]:.1f} n_b={self._n["TYPE_B"]:.1f} | '
                     f'p_A={p_a:.2f} | '
                     f'T={self._current_job_duration.nanoseconds * 1e-9:.1f}s'
@@ -538,7 +595,6 @@ class QupaExperimentNode(Node):
     def destroy_node(self):
         self._publish_velocity(0.0, 0.0)
         self._set_leds(0, 0, 0)
-        self._deactivate_camera()
         self._deactivate_scan()
         super().destroy_node()
 

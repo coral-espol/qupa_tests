@@ -33,17 +33,17 @@ def generate_launch_description():
         output='screen',
         parameters=[
             exp_cfg,
-            {'v_max_mps':        0.08},
+            {'v_max_mps':        0.10},
             {'w_max_rps':        2.50},
             {'obstacle_stop_cm': 15.0},
-            {'sensor_max_cm':    40.0},
+            {'sensor_max_cm':    20.0},
         ],
     )
 
     return LaunchDescription([
 
         DeclareLaunchArgument(
-            'namespace', default_value='qupa_AE',
+            'namespace', default_value='qupa_C0',
             description='Namespace del robot',
         ),
 
