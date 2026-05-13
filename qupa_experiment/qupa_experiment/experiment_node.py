@@ -21,8 +21,10 @@ Service clients:
   leds/set      qupa_msgs/LEDCommand   LED control
 """
 
+import csv
 import json
 import math
+import os
 import random
 
 import rclpy
@@ -107,6 +109,9 @@ class QupaExperimentNode(Node):
         self.declare_parameter('social.count_mode',   'iterative')
         # Greedy bypasses the sigmoid and always accepts a candidate patch.
         self.declare_parameter('greedy_mode',         False)
+
+        # CSV output — empty string disables logging.
+        self.declare_parameter('data_log_path', '')
 
         self.declare_parameter('forgetting.forget_interval_s', 30.0)
 
@@ -208,6 +213,24 @@ class QupaExperimentNode(Node):
         # after each task, NOT derived from n[A] − n[B]. The two may diverge
         # because n is bounded ≥ 0 and decays independently.
         self._m = 0.0
+
+        # ── Data logging ──────────────────────────────────────────────────────
+        self._node_start_time   = now
+        self._search_start_time = now   # reset each time EXPLORE resumes
+        self._csv_file          = None
+        self._csv_writer        = None
+
+        log_path = self.get_parameter('data_log_path').value
+        if log_path:
+            os.makedirs(os.path.dirname(log_path), exist_ok=True)
+            self._csv_file   = open(log_path, 'w', newline='')
+            self._csv_writer = csv.writer(self._csv_file)
+            self._csv_writer.writerow(
+                ['time', 'greedy', 'robot', 'm', 'p_x',
+                 'planned_work_s', 'task', 'search_s']
+            )
+            self._csv_file.flush()
+            self.get_logger().info(f'Data logging → {log_path}')
 
         # LED state cache to suppress redundant service calls
         self._last_led_cmd = None
@@ -510,6 +533,21 @@ class QupaExperimentNode(Node):
                             f'p={self._prob_accept(task_type):.2f}'
                         )
 
+                        if self._csv_writer is not None:
+                            elapsed_s  = (now - self._node_start_time).nanoseconds * 1e-9
+                            search_s   = (now - self._search_start_time).nanoseconds * 1e-9
+                            self._csv_writer.writerow([
+                                f'{elapsed_s:.3f}',
+                                str(self._greedy_mode).lower(),
+                                self.get_namespace().strip('/') or self.get_name(),
+                                f'{self._m:.6f}',
+                                f'{self._prob_accept(task_type):.6f}',
+                                f'{service_s:.3f}',
+                                task_type,
+                                f'{search_s:.3f}',
+                            ])
+                            self._csv_file.flush()
+
                         # Robot will be still during EXECUTE → release scan
                         # (no need to avoid). Camera stays subscribed always.
                         self._deactivate_scan()
@@ -584,10 +622,11 @@ class QupaExperimentNode(Node):
             self._set_leds(0, 0, 0)
 
             if not is_candidate:
-                self._state           = States.EXPLORE
-                self._ignore_until    = now + self._refract_dur
-                self._decision_made   = False
-                self._last_seen_color = 'NONE'
+                self._state             = States.EXPLORE
+                self._search_start_time = now
+                self._ignore_until      = now + self._refract_dur
+                self._decision_made     = False
+                self._last_seen_color   = 'NONE'
                 self.get_logger().info('[FREE] Left patch — resuming exploration.')
 
         self._publish_velocity(v, w)
@@ -596,6 +635,8 @@ class QupaExperimentNode(Node):
         self._publish_velocity(0.0, 0.0)
         self._set_leds(0, 0, 0)
         self._deactivate_scan()
+        if self._csv_file is not None:
+            self._csv_file.close()
         super().destroy_node()
 
 

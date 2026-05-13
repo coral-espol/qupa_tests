@@ -33,11 +33,13 @@ def _spawn_nodes(context, *args, **kwargs):
             "Lista de 'namespaces' vacía. Ejemplo: namespaces:=qupa_3A,qupa_3B"
         )
 
-    exp_pkg = get_package_share_directory('qupa_experiment')
-    exp_cfg = os.path.join(exp_pkg, 'config', 'experiment.yaml')
+    exp_pkg  = get_package_share_directory('qupa_experiment')
+    exp_cfg  = os.path.join(exp_pkg, 'config', 'experiment.yaml')
+    log_dir  = LaunchConfiguration('data_log_dir').perform(context)
 
     nodes = []
     for ns in ns_list:
+        log_path = os.path.join(log_dir, f'{ns}.csv') if log_dir else ''
         nodes.append(Node(
             package='qupa_experiment',
             executable='experiment',
@@ -50,6 +52,7 @@ def _spawn_nodes(context, *args, **kwargs):
                 {'w_max_rps':        1.50},
                 {'obstacle_stop_cm': 15.0},
                 {'sensor_max_cm':    20.0},
+                {'data_log_path':    log_path},
             ],
         ))
     return nodes
@@ -60,8 +63,15 @@ def generate_launch_description():
 
         DeclareLaunchArgument(
             'namespaces',
-            default_value='qupa_3A,qupa_3B',
-            description='Lista de namespaces separados por coma (e.g. qupa_3A,qupa_3B)',
+            default_value='qupa_3A,qupa_C0,qupa_F7,qupa_48',
+            description='Lista de namespaces separados por coma (e.g. qupa_3A,qupa_2C)',
+        ),
+
+        DeclareLaunchArgument(
+            'data_log_dir',
+            default_value=os.path.join(os.path.expanduser('~'), 'qupa_ws', 'exp', 'data'),
+            description='Directorio de salida para los CSV por robot. '
+                        'Vacío = sin logging.',
         ),
 
         OpaqueFunction(function=_spawn_nodes),
