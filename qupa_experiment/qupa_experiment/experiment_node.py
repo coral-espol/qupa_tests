@@ -33,6 +33,7 @@ from rclpy.duration import Duration
 from geometry_msgs.msg import Twist
 from sensor_msgs.msg import LaserScan
 from std_msgs.msg import String
+from qupa_msgs.msg import DetectionArray
 from qupa_msgs.srv import LEDCommand
 
 
@@ -106,7 +107,10 @@ class QupaExperimentNode(Node):
         self.declare_parameter('social.forget_saturation', 3.7)
         # 'iterative' = max simultáneo durante EXECUTE  (Lua: SOCIAL_BOOL=true)
         # 'snapshot'  = conteo al inicio del EXECUTE     (Lua: SOCIAL_BOOL=false)
-        self.declare_parameter('social.count_mode',   'iterative')
+        self.declare_parameter('social.count_mode',           'iterative')
+        # Pixel-proximity threshold for clustering same-color blobs as a
+        # single robot (mirrors Lua CLUSTER_THRESHOLD_CM = 15 cm).
+        self.declare_parameter('social.cluster_threshold_px', 40.0)
         # Greedy bypasses the sigmoid and always accepts a candidate patch.
         self.declare_parameter('greedy_mode',         False)
 
@@ -170,6 +174,7 @@ class QupaExperimentNode(Node):
         self._forget_cap_n  = int(self.get_parameter('social.forget_cap_n').value)
         self._forget_sat    = self.get_parameter('social.forget_saturation').value
         self._count_mode    = self.get_parameter('social.count_mode').value
+        self._cluster_thr   = self.get_parameter('social.cluster_threshold_px').value
         self._greedy_mode   = bool(self.get_parameter('greedy_mode').value)
 
         self._forget_dur    = Duration(
@@ -259,8 +264,8 @@ class QupaExperimentNode(Node):
         # floor/color: always active (needed to detect patches anytime).
         self._scan_sub = None
         self._activate_scan()
-        self.create_subscription(String, 'floor/color',       self._floor_cb,  10)
-        self.create_subscription(String, self._camera_topic,  self._camera_cb, 10)
+        self.create_subscription(String,         'floor/color',      self._floor_cb,  10)
+        self.create_subscription(DetectionArray, self._camera_topic, self._camera_cb, 10)
 
         # ── Main loop ─────────────────────────────────────────────────────────
         self._timer = self.create_timer(self._loop_period, self._step)
@@ -284,15 +289,80 @@ class QupaExperimentNode(Node):
         except Exception:
             pass
 
-    def _camera_cb(self, msg: String):
+    def _camera_cb(self, msg: DetectionArray):
         try:
-            data = json.loads(msg.data)
-            self._neighbor_counts = {
-                'TYPE_A': int(data.get('BLUE',  0)),   # blue LED → MAGENTA task
-                'TYPE_B': int(data.get('GREEN', 0)),   # green LED → YELLOW task
-            }
-            # Only update the EXECUTE-window peak while we're actually tracking
-            # (set by _begin_exec_observation / cleared after Δ/F is applied).
+            # Cluster same-color blobs that are within `cluster_threshold_px`
+            # of an existing cluster centroid (in image-pixel space). Each
+            # surviving cluster represents one neighbour robot. Mirrors the
+            # Lua's CLUSTER_THRESHOLD_CM grouping by radial distance.
+            #
+            # Done in two passes:
+            #   1) Sequential merge as detections arrive (cheap).
+            #   2) Iterative pass that collapses any two final clusters still
+            #      within threshold — fixes order-dependent splits caused by
+            #      a noisy blob breaking the merge chain.
+            clusters = {'TYPE_A': [], 'TYPE_B': []}
+            thr2     = self._cluster_thr * self._cluster_thr
+            for det in msg.targets:
+                if   det.color == 'BLUE':  key = 'TYPE_A'
+                elif det.color == 'GREEN': key = 'TYPE_B'
+                else: continue
+
+                merged = False
+                for i, (ccx, ccy) in enumerate(clusters[key]):
+                    dx, dy = det.cx - ccx, det.cy - ccy
+                    if dx * dx + dy * dy < thr2:
+                        clusters[key][i] = ((ccx + det.cx) / 2.0,
+                                            (ccy + det.cy) / 2.0)
+                        merged = True
+                        break
+                if not merged:
+                    clusters[key].append((det.cx, det.cy))
+
+            # Second pass: keep merging cluster pairs until no two are within
+            # threshold (handles cases where the order of incoming detections
+            # broke the chain in pass 1).
+            for key in ('TYPE_A', 'TYPE_B'):
+                changed = True
+                while changed:
+                    changed = False
+                    n = len(clusters[key])
+                    for i in range(n):
+                        for j in range(i + 1, n):
+                            ax, ay = clusters[key][i]
+                            bx, by = clusters[key][j]
+                            dx, dy = ax - bx, ay - by
+                            if dx * dx + dy * dy < thr2:
+                                clusters[key][i] = ((ax + bx) / 2.0,
+                                                    (ay + by) / 2.0)
+                                clusters[key].pop(j)
+                                changed = True
+                                break
+                        if changed:
+                            break
+
+            new_counts = {'TYPE_A': len(clusters['TYPE_A']),
+                          'TYPE_B': len(clusters['TYPE_B'])}
+
+            # While tracking (i.e. during EXECUTE), log every change in the
+            # same-task count so the social-learning input can be visualised
+            # tick-by-tick. The peak (which feeds Δ) is also shown.
+            if self._tracking_exec_max and self._current_task_type is not None:
+                task = self._current_task_type
+                old  = self._neighbor_counts[task]
+                new  = new_counts[task]
+                if new != old:
+                    peak     = max(self._max_neighbor_counts[task], new)
+                    centers  = ', '.join(
+                        f'({cx:.0f},{cy:.0f})' for cx, cy in clusters[task]
+                    ) or '-'
+                    self.get_logger().info(
+                        f'[SOCIAL] {task} same-task neighbours: '
+                        f'{old} → {new} (peak={peak}) | centers: {centers}'
+                    )
+
+            self._neighbor_counts = new_counts
+
             if self._tracking_exec_max:
                 for k in ('TYPE_A', 'TYPE_B'):
                     if self._neighbor_counts[k] > self._max_neighbor_counts[k]:
@@ -319,10 +389,13 @@ class QupaExperimentNode(Node):
             self._ranges = [float('inf')] * 8
 
     def _begin_exec_observation(self):
-        """Called at the moment we enter EXECUTE. Captures snapshot and
-        primes the per-task peak counter at the snapshot value."""
+        """Called at the moment we enter EXECUTE. Captures the snapshot first,
+        then resets both the latest-sample and peak buffers to zero so this
+        task's observation starts fresh (Lua: max_social_seen = 0 at task
+        start). The first incoming camera message will then log 0 → N."""
         self._snapshot_counts     = dict(self._neighbor_counts)
-        self._max_neighbor_counts = dict(self._neighbor_counts)
+        self._neighbor_counts     = {'TYPE_A': 0, 'TYPE_B': 0}
+        self._max_neighbor_counts = {'TYPE_A': 0, 'TYPE_B': 0}
         self._tracking_exec_max   = True
 
     def _end_exec_observation(self):

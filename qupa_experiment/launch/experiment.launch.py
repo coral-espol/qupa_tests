@@ -10,6 +10,7 @@ Uso:
 """
 
 import os
+import yaml
 
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
@@ -23,6 +24,12 @@ def generate_launch_description():
     exp_pkg = get_package_share_directory('qupa_experiment')
     exp_cfg = os.path.join(exp_pkg, 'config', 'experiment.yaml')
 
+    # Load YAML as plain dict to bypass ROS 2's namespace-aware param matching
+    # (passing the file path silently drops params when a namespace is applied).
+    with open(exp_cfg, 'r') as f:
+        cfg = yaml.safe_load(f)
+    shared_params = cfg.get('experiment_node', {}).get('ros__parameters', {})
+
     ns = LaunchConfiguration('namespace')
 
     experiment_node = Node(
@@ -32,7 +39,7 @@ def generate_launch_description():
         namespace=ns,
         output='screen',
         parameters=[
-            exp_cfg,
+            shared_params,
             {'v_max_mps':        0.10},
             {'w_max_rps':        2.50},
             {'obstacle_stop_cm': 15.0},

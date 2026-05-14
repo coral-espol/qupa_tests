@@ -16,6 +16,7 @@ Uso:
 """
 
 import os
+import yaml
 
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
@@ -37,6 +38,14 @@ def _spawn_nodes(context, *args, **kwargs):
     exp_cfg  = os.path.join(exp_pkg, 'config', 'experiment.yaml')
     log_dir  = LaunchConfiguration('data_log_dir').perform(context)
 
+    # Load YAML as plain dict. Passing the file path directly relies on
+    # ROS 2 matching `experiment_node:` against the node FQN, which fails
+    # silently under a namespace — that left cluster_threshold_px and
+    # other params at their declared defaults.
+    with open(exp_cfg, 'r') as f:
+        cfg = yaml.safe_load(f)
+    shared_params = cfg.get('experiment_node', {}).get('ros__parameters', {})
+
     nodes = []
     for ns in ns_list:
         log_path = os.path.join(log_dir, f'{ns}.csv') if log_dir else ''
@@ -47,7 +56,7 @@ def _spawn_nodes(context, *args, **kwargs):
             namespace=ns,
             output='screen',
             parameters=[
-                exp_cfg,
+                shared_params,
                 {'v_max_mps':        0.0},
                 {'w_max_rps':        0.0},
                 {'obstacle_stop_cm': 15.0},
@@ -63,7 +72,7 @@ def generate_launch_description():
 
         DeclareLaunchArgument(
             'namespaces',
-            default_value='qupa_48',
+            default_value='qupa_7E,qupa_27',
             description='Lista de namespaces separados por coma (e.g. qupa_3A,qupa_2C)',
         ),
 

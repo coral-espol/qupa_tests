@@ -66,12 +66,16 @@ experiment_node:
     #   'iterative' → max simultáneo durante EXECUTE   (Lua SOCIAL_BOOL=true)
     #   'snapshot'  → conteo al inicio del EXECUTE     (Lua SOCIAL_BOOL=false)
     social:
-      alpha:              0.9
-      beta:               1.5
-      delta_cap_n:        3
-      forget_cap_n:       2
-      forget_saturation:  3.7
-      count_mode:         iterative
+      alpha:                0.9
+      beta:                 1.5
+      delta_cap_n:          3
+      forget_cap_n:         2
+      forget_saturation:    3.7
+      count_mode:           iterative
+      # Pixel proximity to merge same-color blobs into a single robot.
+      # Mirrors Lua CLUSTER_THRESHOLD_CM = 15 cm. Tune to ~apparent robot
+      # diameter in the omnidirectional view (40 px ≈ medium-distance robot).
+      cluster_threshold_px: 90.0
 
     # --- Time-based forgetting ---
     # Both n_a and n_b decay by 1 toward 0 every forget_interval_s

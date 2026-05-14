@@ -14,6 +14,7 @@
   <exec_depend>std_msgs</exec_depend>
   <exec_depend>geometry_msgs</exec_depend>
   <exec_depend>sensor_msgs</exec_depend>
+  <exec_depend>qupa_msgs</exec_depend>
 
   <!-- Hardware stack must be running -->
   <exec_depend>qupa_hardware</exec_depend>
