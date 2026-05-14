@@ -48,8 +48,8 @@ def _spawn_nodes(context, *args, **kwargs):
             output='screen',
             parameters=[
                 exp_cfg,
-                {'v_max_mps':        0.10},
-                {'w_max_rps':        1.50},
+                {'v_max_mps':        0.0},
+                {'w_max_rps':        0.0},
                 {'obstacle_stop_cm': 15.0},
                 {'sensor_max_cm':    20.0},
                 {'data_log_path':    log_path},
@@ -63,7 +63,7 @@ def generate_launch_description():
 
         DeclareLaunchArgument(
             'namespaces',
-            default_value='qupa_3A,qupa_C0,qupa_F7,qupa_48',
+            default_value='qupa_48',
             description='Lista de namespaces separados por coma (e.g. qupa_3A,qupa_2C)',
         ),
 

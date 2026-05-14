@@ -73,10 +73,10 @@ class QupaExperimentNode(Node):
         # ── Parameters ────────────────────────────────────────────────────────
         self.declare_parameter('loop_rate_hz',     5.0)
         self.declare_parameter('refractory_s',     2.0)
-        self.declare_parameter('fwd_speed_ratio',  0.6)
-        self.declare_parameter('prox_threshold',   0.4)
-        self.declare_parameter('prox_gain',        3.0)
-        self.declare_parameter('torque_deadzone',  0.15)
+        self.declare_parameter('fwd_speed_ratio',  1.0)
+        self.declare_parameter('prox_threshold',   0.05)
+        self.declare_parameter('prox_gain',        2.0)
+        self.declare_parameter('torque_deadzone',  0.6)
 
         # Stuck recovery — forced in-place rotation when deadzone persists.
         self.declare_parameter('stuck_threshold_s', 1.5)
@@ -87,13 +87,13 @@ class QupaExperimentNode(Node):
         self.declare_parameter('type_b_colors', ['YELLOW'])
 
         # Task timing — all in seconds; m affects duration linearly.
-        self.declare_parameter('task_timing.base_work_s',    10.0)
-        self.declare_parameter('task_timing.min_work_s',      3.0)
+        self.declare_parameter('task_timing.base_work_s',    60.0)
+        self.declare_parameter('task_timing.min_work_s',      8.0)
         self.declare_parameter('task_timing.learning_step_s', 1.0)
 
-        self.declare_parameter('specialization.m_max',  5)
+        self.declare_parameter('specialization.m_max',  12)
         self.declare_parameter('specialization.gamma',  1.0)
-        self.declare_parameter('specialization.k',      1.0)
+        self.declare_parameter('specialization.k',      1.15)
 
         # Social-learning reward/penalty modulation (see Δ and F formulas).
         # n_same = neighbours running the same task as the one just completed.
@@ -418,7 +418,7 @@ class QupaExperimentNode(Node):
         # The applied delta is 1.0 (individual increment) + reward (social).
         n      = min(n_same, self._delta_cap_n)
         reward = 1.0 + self._alpha * n
-        return 1.0 + reward
+        return reward
 
     def _social_forget(self, n_same: int) -> float:
         # Mirrors Lua: piecewise — linear under cap, hardcoded saturation above.
@@ -508,10 +508,14 @@ class QupaExperimentNode(Node):
                 self._set_leds(255, 100, 0)   # Amber while avoiding
 
             else:
-                # Reset decision flag when floor returns to neutral
+                # Reset decision flag when floor returns to neutral,
+                # or when the refractory timer expires while still on the patch
+                # (needed when the robot is stationary — it never leaves the patch).
                 if not is_candidate:
                     self._decision_made   = False
                     self._last_seen_color = 'NONE'
+                elif not ignoring and self._decision_made:
+                    self._decision_made = False
 
                 if is_candidate and not ignoring and not self._decision_made:
                     task_type = 'TYPE_A' if is_type_a else 'TYPE_B'
@@ -604,6 +608,10 @@ class QupaExperimentNode(Node):
                 # Camera stays subscribed; just bring scan back for EXIT_PATCH.
                 self._activate_scan()
 
+                # _ignore_until doubles as the EXIT timeout: if the robot is
+                # stationary it will never physically leave the patch, so this
+                # timer lets EXIT transition back to EXPLORE after refractory_s.
+                self._ignore_until = now + self._refract_dur
                 self._state = States.EXIT
                 p_a = 1.0 / (1.0 + math.exp(-self._gamma * self._m))
                 self.get_logger().info(
@@ -621,7 +629,7 @@ class QupaExperimentNode(Node):
             v, w = nav_v, nav_w
             self._set_leds(0, 0, 0)
 
-            if not is_candidate:
+            if not is_candidate or now >= self._ignore_until:
                 self._state             = States.EXPLORE
                 self._search_start_time = now
                 self._ignore_until      = now + self._refract_dur
