@@ -1,0 +1,7 @@
+experiment_timer_node:
+  ros__parameters:
+
+    # Total experiment duration in seconds.
+    # The timer node publishes /experiment/running=True when started,
+    # and =False when this duration elapses (or experiment/stop is called).
+    duration_s: 600.0

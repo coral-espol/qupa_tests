@@ -17,6 +17,7 @@ Uso:
 
 import os
 import yaml
+from datetime import datetime
 
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
@@ -72,13 +73,16 @@ def generate_launch_description():
 
         DeclareLaunchArgument(
             'namespaces',
-            default_value='qupa_7E,qupa_27',
+            default_value='qupa_F7, qupa_7E',
             description='Lista de namespaces separados por coma (e.g. qupa_3A,qupa_2C)',
         ),
 
         DeclareLaunchArgument(
             'data_log_dir',
-            default_value=os.path.join(os.path.expanduser('~'), 'qupa_ws', 'exp', 'data'),
+            default_value=os.path.join(
+                os.path.expanduser('~'), 'qupa_ws', 'data_3',
+                datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
+            ),
             description='Directorio de salida para los CSV por robot. '
                         'Vacío = sin logging.',
         ),

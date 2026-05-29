@@ -30,9 +30,10 @@ import random
 import rclpy
 from rclpy.node import Node
 from rclpy.duration import Duration
+from rclpy.qos import QoSProfile, DurabilityPolicy, ReliabilityPolicy
 from geometry_msgs.msg import Twist
 from sensor_msgs.msg import LaserScan
-from std_msgs.msg import String
+from std_msgs.msg import String, Bool
 from qupa_msgs.msg import DetectionArray
 from qupa_msgs.srv import LEDCommand
 
@@ -61,6 +62,7 @@ SENSOR_SLOTS: list[tuple[int, float]] = [
 
 
 class States:
+    WAITING = 'WAITING'
     EXPLORE = 'EXPLORE'
     EXECUTE = 'EXECUTE'
     EXIT    = 'EXIT_PATCH'
@@ -194,7 +196,7 @@ class QupaExperimentNode(Node):
         # ── Behaviour state ───────────────────────────────────────────────────
         now = self.get_clock().now()
 
-        self._state                = States.EXPLORE
+        self._state                = States.WAITING
         self._execute_start        = now
         self._current_job_duration = Duration(seconds=self._base_work_s)
         self._current_task_type    = None
@@ -219,11 +221,16 @@ class QupaExperimentNode(Node):
         # because n is bounded ≥ 0 and decays independently.
         self._m = 0.0
 
+        # ── Experiment timer state ────────────────────────────────────────────
+        # Set to True when /experiment/running publishes True.
+        # CSV rows are only written while the experiment is active.
+        self._experiment_running    = False
+        self._experiment_start_time = None
+        self._search_start_time     = now   # reset each time EXPLORE resumes
+
         # ── Data logging ──────────────────────────────────────────────────────
-        self._node_start_time   = now
-        self._search_start_time = now   # reset each time EXPLORE resumes
-        self._csv_file          = None
-        self._csv_writer        = None
+        self._csv_file   = None
+        self._csv_writer = None
 
         log_path = self.get_parameter('data_log_path').value
         if log_path:
@@ -231,14 +238,16 @@ class QupaExperimentNode(Node):
             self._csv_file   = open(log_path, 'w', newline='')
             self._csv_writer = csv.writer(self._csv_file)
             self._csv_writer.writerow(
-                ['time', 'greedy', 'robot', 'm', 'p_x',
-                 'planned_work_s', 'task', 'search_s']
+                ['tick', 'greedy', 'robot', 'm', 'p_x',
+                 'planned_wticks', 'task', 'search_ticks', 'x', 'y', 'seed']
             )
             self._csv_file.flush()
             self.get_logger().info(f'Data logging → {log_path}')
 
-        # LED state cache to suppress redundant service calls
-        self._last_led_cmd = None
+        # LED state cache — suppresses redundant calls but retries if the
+        # service response is never received (WiFi packet loss).
+        self._last_led_cmd       = None
+        self._last_led_send_time = now
 
         # Social-learning observation buffers.
         #   _neighbor_counts     → latest sample from the camera
@@ -262,15 +271,26 @@ class QupaExperimentNode(Node):
         #   EXECUTE (mirrors the Lua, where the omnidirectional camera is
         #   queried directly at the patch-entry instant).
         # floor/color: always active (needed to detect patches anytime).
+        # /experiment/running: TRANSIENT_LOCAL so late-joining nodes receive the
+        #   current state immediately upon connection.
         self._scan_sub = None
-        self._activate_scan()
+        # Scan activates only when experiment starts (WAITING → EXPLORE).
         self.create_subscription(String,         'floor/color',      self._floor_cb,  10)
         self.create_subscription(DetectionArray, self._camera_topic, self._camera_cb, 10)
+
+        _latched_qos = QoSProfile(
+            depth=1,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            reliability=ReliabilityPolicy.RELIABLE,
+        )
+        self.create_subscription(
+            Bool, '/experiment/running', self._experiment_state_cb, _latched_qos
+        )
 
         # ── Main loop ─────────────────────────────────────────────────────────
         self._timer = self.create_timer(self._loop_period, self._step)
 
-        self._set_leds(255, 165, 0)   # Orange on boot
+        self._set_leds(255, 255, 255)   # White = waiting for experiment start
         self.get_logger().info(
             f'Experiment node ready @ {loop_hz:.1f} Hz | '
             f'TYPE_A={self._type_a_colors} TYPE_B={self._type_b_colors}'
@@ -288,6 +308,27 @@ class QupaExperimentNode(Node):
             self._last_floor = json.loads(msg.data)
         except Exception:
             pass
+
+    def _experiment_state_cb(self, msg: Bool):
+        if msg.data and not self._experiment_running:
+            now = self.get_clock().now()
+            self._experiment_start_time = now
+            self._search_start_time     = now
+            self._state = States.EXPLORE
+            self._activate_scan()
+            self.get_logger().info('Experiment STARTED — beginning exploration.')
+        elif not msg.data and self._experiment_running:
+            if self._state == States.EXECUTE:
+                self._end_exec_observation()
+            self._deactivate_scan()
+            self._state = States.WAITING
+            self.get_logger().info('Experiment ENDED — shutting down.')
+            self._shutdown_timer = self.create_timer(0.5, self._do_shutdown)
+        self._experiment_running = msg.data
+
+    def _do_shutdown(self):
+        self._shutdown_timer.cancel()
+        rclpy.try_shutdown()
 
     def _camera_cb(self, msg: DetectionArray):
         try:
@@ -536,18 +577,32 @@ class QupaExperimentNode(Node):
     # =========================================================
 
     def _set_leds(self, r: int, g: int, b: int):
-        new = (r, g, b)
-        if self._last_led_cmd == new:
+        new   = (r, g, b)
+        now   = self.get_clock().now()
+        age_s = (now - self._last_led_send_time).nanoseconds * 1e-9
+        if self._last_led_cmd == new and age_s < 2.0:
             return
-        self._last_led_cmd = new
+        self._last_led_cmd       = new
+        self._last_led_send_time = now
         req         = LEDCommand.Request()
         req.command = json.dumps({'mode': 'set_all', 'rgb': [r, g, b]})
-        self._led_cli.call_async(req)  # fire-and-forget
+        fut = self._led_cli.call_async(req)
+        fut.add_done_callback(lambda f: self._led_done_cb(f))
+
+    def _led_done_cb(self, future):
+        try:
+            result = future.result()
+            if not result.success:
+                self.get_logger().warn(f'LED service returned failure: {result.message}')
+                self._last_led_cmd = None   # force retry next tick
+        except Exception as e:
+            self.get_logger().warn(f'LED service call failed: {e}')
+            self._last_led_cmd = None       # force retry next tick
 
     def _update_patrol_leds(self, now):
         phase_ns = now.nanoseconds % self._patrol_period_ns
         if phase_ns < self._patrol_on_ns:
-            self._set_leds(255, 165, 0)   # Orange
+            self._set_leds(0, 0, 0)   # Orange
         else:
             self._set_leds(0, 0, 0)       # Off
 
@@ -563,6 +618,13 @@ class QupaExperimentNode(Node):
 
     def _step(self):
         now = self.get_clock().now()
+
+        # ---- WAITING — parado hasta recibir la señal del timer ----
+        if self._state == States.WAITING:
+            self._publish_velocity(0.0, 0.0)
+            self._set_leds(255, 255, 255)   # White = waiting
+            return
+
         v, w = 0.0, 0.0
         nav_v, nav_w, avoiding = self._get_vector_move_cmd(now)
 
@@ -578,7 +640,7 @@ class QupaExperimentNode(Node):
             v, w = nav_v, nav_w
 
             if avoiding:
-                self._set_leds(255, 100, 0)   # Amber while avoiding
+                self._set_leds(0, 0, 0)   # Amber while avoiding
 
             else:
                 # Reset decision flag when floor returns to neutral,
@@ -610,9 +672,11 @@ class QupaExperimentNode(Node):
                             f'p={self._prob_accept(task_type):.2f}'
                         )
 
-                        if self._csv_writer is not None:
-                            elapsed_s  = (now - self._node_start_time).nanoseconds * 1e-9
-                            search_s   = (now - self._search_start_time).nanoseconds * 1e-9
+                        if (self._csv_writer is not None
+                                and self._experiment_running
+                                and self._experiment_start_time is not None):
+                            elapsed_s = (now - self._experiment_start_time).nanoseconds * 1e-9
+                            search_s  = (now - self._search_start_time).nanoseconds * 1e-9
                             self._csv_writer.writerow([
                                 f'{elapsed_s:.3f}',
                                 str(self._greedy_mode).lower(),
@@ -622,6 +686,9 @@ class QupaExperimentNode(Node):
                                 f'{service_s:.3f}',
                                 task_type,
                                 f'{search_s:.3f}',
+                                '0',
+                                '0',
+                                '0',
                             ])
                             self._csv_file.flush()
 
@@ -714,7 +781,11 @@ class QupaExperimentNode(Node):
 
     def destroy_node(self):
         self._publish_velocity(0.0, 0.0)
-        self._set_leds(0, 0, 0)
+        req = LEDCommand.Request()
+        req.command = json.dumps({'mode': 'clear'})
+        if self._led_cli.service_is_ready():
+            future = self._led_cli.call_async(req)
+            rclpy.spin_until_future_complete(self, future, timeout_sec=1.0)
         self._deactivate_scan()
         if self._csv_file is not None:
             self._csv_file.close()

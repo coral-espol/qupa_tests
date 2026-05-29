@@ -5,7 +5,7 @@ experiment_node:
     loop_rate_hz: 5.0           # Hz — behaviour loop rate (lower = lighter CPU)
 
     # --- Refractory period ---
-    refractory_s: 2.0           # seconds to ignore a patch after a decision
+    refractory_s: 3.0           # seconds to ignore a patch after a decision
 
     # --- Navigation ---
     fwd_speed_ratio:  1.0       # fraction of v_max used during exploration
@@ -75,7 +75,7 @@ experiment_node:
       # Pixel proximity to merge same-color blobs into a single robot.
       # Mirrors Lua CLUSTER_THRESHOLD_CM = 15 cm. Tune to ~apparent robot
       # diameter in the omnidirectional view (40 px ≈ medium-distance robot).
-      cluster_threshold_px: 90.0
+      cluster_threshold_px: 110.0
 
     # --- Time-based forgetting ---
     # Both n_a and n_b decay by 1 toward 0 every forget_interval_s

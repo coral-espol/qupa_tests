@@ -1,116 +1,190 @@
-# qupa_experiment
+# Qupa Experiment
 
-Implementación ROS 2 del experimento de asignación distribuida de tareas
-basado en Brutschy et al. (2012), con aprendizaje social modulado por
-vecinos detectados vía cámara.
+Implementación ROS 2 del experimento de asignación distribuida de tareas basado en Brutschy et al. (2012), con aprendizaje social modulado por vecinos detectados vía cámara omnidireccional.
 
-Cada robot ejecuta una copia de `experiment_node` bajo su propio namespace.
-La lógica es idéntica para todos los robots; lo único que cambia es el
-namespace, que separa los topics y servicios por robot.
+Los robots arrancan inmóviles esperando la señal del timer. Al recibirla, comienzan a explorar y registrar datos. Cuando el tiempo configurado expira, los nodos se cierran solos.
 
 ---
 
-## Pre-requisitos
+## Contenido
 
-Antes de lanzar el experimento, `hardware.launch.py` debe estar corriendo
-en cada robot físico (provee `scan`, `floor/color`, `cmd_vel`, `leds/set`,
-`uv_led/set`):
+- [Pre Requisitos](#pre-requisitos)
+- [Build](#build)
+- [Flujo Del Experimento](#flujo-del-experimento)
+- [Salida De Datos](#salida-de-datos)
+- [Configuración](#configuración)
+- [Topics Y Servicios](#topics-y-servicios)
+- [Estados Del Robot](#estados-del-robot)
+- [Diagnóstico Rápido](#diagnóstico-rápido)
+- [Mantenedor](#mantenedor)
+
+---
+
+## Pre Requisitos
+
+`hardware.launch.py` y `camera.launch.py` deben estar corriendo en cada robot físico antes de lanzar el experimento:
 
 ```bash
-# En cada robot
-ros2 launch qupa_hardware hardware.launch.py namespace:=qupa_3A
+ros2 launch qupa_hardware hardware.launch.py
+ros2 launch qupa_hardware camera.launch.py
+```
+Considera el uso de `tmux` para correr ambos nodos.  
+Todas las máquinas deben compartir el mismo `ROS_DOMAIN_ID` para descubrirse mutuamente vía DDS. Adicional a esto revisen los logs en las consolas para verificar si esta correcto 
+
+---
+
+## Build
+
+```bash
+cd ~/experiment_ws
+colcon build --packages-select qupa_experiment
+source install/setup.bash
 ```
 
 ---
 
-## Lanzar un solo robot
+## Flujo Del Experimento
+
+### Paso 1 — Nodos De Comportamiento
+
+Los robots arrancan en estado WAITING (LEDs blancos, sin moverse):
 
 ```bash
-# Default namespace (qupa_C0)
-ros2 launch qupa_experiment experiment.launch.py
-
-# Namespace explícito
-ros2 launch qupa_experiment experiment.launch.py namespace:=qupa_3B
-```
-
-El nodo se publicará bajo `/qupa_3B/experiment_node` y consumirá los topics
-`/qupa_3B/scan`, `/qupa_3B/floor/color`, `/qupa_3B/camera/detections`, etc.
-
----
-
-## Lanzar varios robots a la vez
-
-`experiment_multi.launch.py` toma una lista de namespaces separados por
-coma y arranca una instancia del mismo nodo para cada uno. Útil cuando se
-quiere coordinar el experimento desde una sola PC.
-
-```bash
-# Default: qupa_3A,qupa_3B
-ros2 launch qupa_experiment experiment_multi.launch.py
-
-# Lista explícita
 ros2 launch qupa_experiment experiment_multi.launch.py \
-    namespaces:=qupa_3A,qupa_3B,qupa_F4
+    namespaces:=q0,q1,q2,q3 \
+    data_log_dir:=/home/estudiante/datos/experimento_1
 ```
 
-> **Nota:** cada robot debe tener su propio hardware corriendo (cada Pi
-> ejecuta `hardware.launch.py` con su namespace). Este launch solo levanta
-> los nodos de comportamiento, que se conectan a los topics del namespace
-> correspondiente vía DDS. Asegúrate de que **todas las máquinas
-> compartan el mismo `ROS_DOMAIN_ID`** para que se descubran mutuamente.
+### Paso 2 — Timer
+
+```bash
+ros2 launch qupa_experiment timer.launch.py duration_s:=600.0
+```
+
+### Paso 3 — Iniciar
+
+```bash
+ros2 service call /experiment/start std_srvs/srv/Trigger
+```
+
+Todos los robots arrancan simultáneamente y comienzan a explorar. Al llegar a `duration_s` segundos, los nodos se cierran solos.
+
+### Paso 4 — Detener Antes De Tiempo
+
+```bash
+ros2 service call /experiment/stop std_srvs/srv/Trigger
+```
 
 ---
 
-## Variante clásica
+## Salida De Datos
 
-`experiment_classic.launch.py` lanza la versión sin aprendizaje social
-(`experiment_node_classic.py`), reproduciendo el modelo Brutschy original
-+1/−1 con sigmoide simple.
+Cada robot genera un CSV en `data_log_dir/<namespace>.csv`:
 
-```bash
-ros2 launch qupa_experiment experiment_classic.launch.py namespace:=qupa_F4
 ```
+tick,greedy,robot,m,p_x,planned_wticks,task,search_ticks,x,y,seed
+53.241,false,q0,0.000000,0.500000,60.000,TYPE_A,3.120,0,0,0
+127.883,false,q0,1.000000,0.731059,57.300,TYPE_A,5.440,0,0,0
+```
+
+| Columna          | Descripción                                               |
+|------------------|-----------------------------------------------------------|
+| `tick`           | Segundos desde el inicio del experimento                  |
+| `greedy`         | `true` si el robot siempre acepta, omitiendo la sigmoide  |
+| `robot`          | Namespace del robot                                       |
+| `m`              | Memoria de especialización signed (−m_max … +m_max)       |
+| `p_x`            | Probabilidad de aceptación al momento de la decisión      |
+| `planned_wticks` | Tiempo de servicio asignado a la tarea (segundos)         |
+| `task`           | Tipo de tarea aceptada (`TYPE_A` / `TYPE_B`)              |
+| `search_ticks`   | Duración de la búsqueda hasta encontrar esta tarea (s)    |
+| `x`, `y`         | No disponible en esta configuración (fijo `0`)            |
+| `seed`           | No usada en esta configuración (fijo `0`)                 |
 
 ---
 
 ## Configuración
 
-Los parámetros del modelo están en
-[config/experiment.yaml](config/experiment.yaml).
-Los launch files cargan ese YAML y sobrescriben solo los parámetros de
-kinemática del robot. Para cambiar el comportamiento (timings, sigmoid,
-aprendizaje social), edita el YAML y reconstruye:
+| Archivo                  | Contenido                                      |
+|--------------------------|------------------------------------------------|
+| `config/experiment.yaml` | Modelo de especialización, tiempos, navegación |
+| `config/timer.yaml`      | Duración del experimento (`duration_s`)        |
 
-```bash
-colcon build --packages-select qupa_experiment
+### Parámetros Clave
+
+```yaml
+# config/experiment.yaml
+refractory_s: 3.0          # tiempo muerto entre tareas (segundos)
+task_timing:
+  base_work_s:  60.0       # tiempo de servicio base
+  min_work_s:    8.0       # tiempo mínimo tras especialización completa
+specialization:
+  m_max: 12                # límite del contador de especialización
+greedy_mode: false         # true = siempre acepta, omite la sigmoide
 ```
 
----
+```yaml
+# config/timer.yaml
+duration_s: 600.0          # duración total del experimento
+```
 
-## Topics y servicios
-
-| Tipo          | Nombre (relativo al namespace)         | Dirección |
-|---------------|-----------------------------------------|-----------|
-| Subscriber    | `scan` (`sensor_msgs/LaserScan`)        | in        |
-| Subscriber    | `floor/color` (`std_msgs/String`)       | in        |
-| Subscriber    | `camera/detections` (`std_msgs/String`) | in        |
-| Publisher     | `cmd_vel` (`geometry_msgs/Twist`)       | out       |
-| Service client| `leds/set` (`qupa_msgs/LEDCommand`)     | out       |
+Tras editar cualquier YAML, reconstruye con `colcon build --packages-select qupa_experiment`.
 
 ---
 
-## Diagnóstico rápido
+## Topics Y Servicios
+
+### Por Robot
+
+| Tipo           | Nombre                                           | Dirección |
+|----------------|--------------------------------------------------|-----------|
+| Subscriber     | `scan` (`sensor_msgs/LaserScan`)                 | entrada   |
+| Subscriber     | `floor/color` (`std_msgs/String`)                | entrada   |
+| Subscriber     | `camera/detections` (`qupa_msgs/DetectionArray`) | entrada   |
+| Publisher      | `cmd_vel` (`geometry_msgs/Twist`)                | salida    |
+| Service client | `leds/set` (`qupa_msgs/LEDCommand`)              | salida    |
+
+### Globales
+
+| Tipo      | Nombre                                    | Descripción                          |
+|-----------|-------------------------------------------|--------------------------------------|
+| Publisher | `/experiment/running` (`std_msgs/Bool`)   | `true` mientras el experimento corre |
+| Service   | `/experiment/start` (`std_srvs/Trigger`)  | Inicia el temporizador               |
+| Service   | `/experiment/stop` (`std_srvs/Trigger`)   | Detiene el experimento               |
+
+---
+
+## Estados Del Robot
+
+| Estado    | LEDs                        | Comportamiento                        |
+|-----------|-----------------------------|---------------------------------------|
+| WAITING   | Blanco                      | Parado, esperando señal de inicio     |
+| EXPLORE   | Naranja (parpadeo patrol)   | Navegando, buscando parches           |
+| EXECUTE   | Azul (TYPE_A) / Verde (TYPE_B) | Ejecutando tarea, quieto           |
+| EXIT      | Apagado                     | Saliendo del parche                   |
+
+---
+
+## Diagnóstico Rápido
 
 ```bash
-# ¿Está vivo el nodo?
+# Estado del experimento
+ros2 topic echo /experiment/running
+
+# Logs de un robot (busca [JOB], [SKIP], [DONE])
+ros2 topic echo /q0/cmd_vel
+
+# Datos del sensor de piso
+ros2 topic echo /q0/floor/color
+
+# Nodos activos
 ros2 node list | grep experiment
-
-# ¿Está publicando velocidades?
-ros2 topic echo /qupa_3A/cmd_vel
-
-# ¿Llegan datos del piso?
-ros2 topic echo /qupa_3A/floor/color
-
-# ¿Tiene suscriptor el cmd_vel? (debe ser ≥ 1, el motor_driver)
-ros2 topic info /qupa_3A/cmd_vel
 ```
+
+---
+
+## Mantenedor
+
+**David Torres**  
+Ing. Mecatrónico — ESPOL  
+Técnico de Laboratorio, Collaborative Robotics and Artificial Intelligence Laboratory (CoRAL)  
+davatorr@espol.edu.ec
