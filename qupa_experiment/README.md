@@ -8,42 +8,58 @@ Los robots arrancan inmóviles esperando la señal del timer. Al recibirla, comi
 
 ## Contenido
 
-- [Pre Requisitos](#pre-requisitos)
-- [Build](#build)
-- [Flujo Del Experimento](#flujo-del-experimento)
-- [Salida De Datos](#salida-de-datos)
-- [Configuración](#configuración)
-- [Topics Y Servicios](#topics-y-servicios)
-- [Estados Del Robot](#estados-del-robot)
-- [Diagnóstico Rápido](#diagnóstico-rápido)
+- [0. Pre Requisitos](#0-pre-requisitos)
+- [1. Instalación](#1-instalación)
+- [2. Compilación](#2-compilación)
+- [3. Flujo Del Experimento](#3-flujo-del-experimento)
+- [4. Salida De Datos](#4-salida-de-datos)
+- [5. Configuración](#5-configuración)
+- [6. Topics Y Servicios](#6-topics-y-servicios)
+- [7. Estados Del Robot](#7-estados-del-robot)
+- [8. Diagnóstico Rápido](#8-diagnóstico-rápido)
 - [Mantenedor](#mantenedor)
 
 ---
 
-## Pre Requisitos
+## 0. Pre Requisitos
 
-`hardware.launch.py` y `camera.launch.py` deben estar corriendo en cada robot físico antes de lanzar el experimento:
+- ROS 2 Humble instalado
+- Workspace de ROS 2 en `~/qupa_ws`
+- `hardware.launch.py` y `camera.launch.py` corriendo en cada robot físico antes de lanzar el experimento:
 
 ```bash
 ros2 launch qupa_hardware hardware.launch.py
 ros2 launch qupa_hardware camera.launch.py
 ```
-Considera el uso de `tmux` para correr ambos nodos.  
-Todas las máquinas deben compartir el mismo `ROS_DOMAIN_ID` para descubrirse mutuamente vía DDS. Adicional a esto revisen los logs en las consolas para verificar si esta correcto 
+
+Considera el uso de `tmux` para correr ambos nodos. Todas las máquinas deben compartir el mismo `ROS_DOMAIN_ID` para descubrirse mutuamente vía DDS. Revisa los logs en consola para verificar que la conexión es correcta.
 
 ---
 
-## Build
+## 1. Instalación
+
+Clona los dos repositorios necesarios dentro del workspace:
 
 ```bash
-cd ~/experiment_ws
+mkdir -p ~/qupa_ws/src && cd ~/qupa_ws/src
+
+git clone https://github.com/coral-espol/qupa.git
+git clone https://github.com/coral-espol/qupa_tests.git
+```
+
+---
+
+## 2. Compilación
+
+```bash
+cd ~/qupa_ws
 colcon build --packages-select qupa_experiment
 source install/setup.bash
 ```
 
 ---
 
-## Flujo Del Experimento
+## 3. Flujo Del Experimento
 
 ### Paso 1 — Nodos De Comportamiento
 
@@ -77,7 +93,7 @@ ros2 service call /experiment/stop std_srvs/srv/Trigger
 
 ---
 
-## Salida De Datos
+## 4. Salida De Datos
 
 Cada robot genera un CSV en `data_log_dir/<namespace>.csv`:
 
@@ -102,7 +118,7 @@ tick,greedy,robot,m,p_x,planned_wticks,task,search_ticks,x,y,seed
 
 ---
 
-## Configuración
+## 5. Configuración
 
 | Archivo                  | Contenido                                      |
 |--------------------------|------------------------------------------------|
@@ -131,7 +147,7 @@ Tras editar cualquier YAML, reconstruye con `colcon build --packages-select qupa
 
 ---
 
-## Topics Y Servicios
+## 6. Topics Y Servicios
 
 ### Por Robot
 
@@ -153,28 +169,28 @@ Tras editar cualquier YAML, reconstruye con `colcon build --packages-select qupa
 
 ---
 
-## Estados Del Robot
+## 7. Estados Del Robot
 
-| Estado    | LEDs                        | Comportamiento                        |
-|-----------|-----------------------------|---------------------------------------|
-| WAITING   | Blanco                      | Parado, esperando señal de inicio     |
-| EXPLORE   | Naranja (parpadeo patrol)   | Navegando, buscando parches           |
-| EXECUTE   | Azul (TYPE_A) / Verde (TYPE_B) | Ejecutando tarea, quieto           |
-| EXIT      | Apagado                     | Saliendo del parche                   |
+| Estado  | LEDs                              | Comportamiento                    |
+|---------|-----------------------------------|-----------------------------------|
+| WAITING | Blanco                            | Parado, esperando señal de inicio |
+| EXPLORE | Naranja (parpadeo patrol)         | Navegando, buscando parches       |
+| EXECUTE | Azul (TYPE_A) / Verde (TYPE_B)    | Ejecutando tarea, quieto          |
+| EXIT    | Apagado                           | Saliendo del parche               |
 
 ---
 
-## Diagnóstico Rápido
+## 8. Diagnóstico Rápido
 
 ```bash
 # Estado del experimento
 ros2 topic echo /experiment/running
 
-# Logs de un robot (busca [JOB], [SKIP], [DONE])
-ros2 topic echo /q0/cmd_vel
-
-# Datos del sensor de piso
+# Datos del sensor de piso de un robot
 ros2 topic echo /q0/floor/color
+
+# Velocidades publicadas por un robot
+ros2 topic echo /q0/cmd_vel
 
 # Nodos activos
 ros2 node list | grep experiment
