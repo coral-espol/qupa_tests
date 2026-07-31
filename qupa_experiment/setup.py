@@ -31,6 +31,7 @@ setup(
             'experiment_timer   = qupa_experiment.experiment_timer_node:main',
             'led_test           = qupa_experiment.led_test:main',
             'forward_stop_test  = qupa_experiment.forward_stop_test:main',
+            'color_behavior     = qupa_experiment.color_behavior_node:main',
         ],
     },
 )

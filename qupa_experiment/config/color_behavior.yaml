@@ -1,0 +1,40 @@
+# color_behavior.yaml — parámetros compartidos por todas las instancias de
+# color_behavior_node. Se aplican con wildcard de namespace (/**) para que
+# valgan sin importar el namespace del robot (qupa, qupa_2, ...).
+/**/color_behavior_node:
+  ros__parameters:
+    loop_rate_hz:        10.0
+
+    # Velocidades (m/s, rad/s)
+    explore_speed_mps:   0.06
+    aggregate_speed_mps: 0.06
+    v_max_mps:           0.08
+    w_max_rps:           2.0
+
+    # Colores tal como los publica la cámara (camera/detections)
+    green_color:  'GREEN'
+    blue_color:   'BLUE'
+    blue_rgb:     [0, 0, 255]
+
+    # Detección
+    min_area:            120
+    detection_timeout_s: 0.7
+
+    # Agregación hacia el azul + llegada
+    #   steer_sign: +1 gira HACIA el azul. Si va al lado opuesto, poner -1.
+    steer_sign:            1.0
+    steer_gain:            0.03
+    heading_deadzone_deg:  8.0    # gap ±8° al frente: dentro no gira (evita bailoteo)
+    face_deg:             25.0    # |ángulo|<esto = encarado → puede "llegar" y encender azul
+    arrival_distance_m:   0.15    # 15 cm (confirmación por lidar)
+    arrival_min_area:      1400    # px²: el blob AZUL debe ser ≥ esto para "llegar"
+    #    (confirmación por cámara: evita encender por un obstáculo al frente que no
+    #    es el azul. Calíbralo mirando camera/detections 'area' del azul a ~15 cm)
+    front_half_deg:       50.0    # arco frontal de seguridad (rayos 0,±45) para frenar/esquivar
+
+    # Exploración / evasión de obstáculos
+    obstacle_stop_m:     0.20
+    avoid_turn_rps:      1.2
+    wander_turn_rps:     0.6
+    wander_min_s:        1.0
+    wander_max_s:        3.0
